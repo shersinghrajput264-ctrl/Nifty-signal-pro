@@ -1,12 +1,6 @@
 # ============================================================
 # NIFTY + STOCK SIGNAL PRO V4
-# Robust / safer / completed-candle / liquidity-aware
-# Streamlit + Yahoo Finance
-#
-# IMPORTANT:
-# - This is an analysis/scanner tool, NOT guaranteed-profit software.
-# - Yahoo Finance is not a broker-grade execution feed.
-# - Always verify live broker price, bid/ask, liquidity and slippage.
+# Robust • Completed Candle • Liquidity Aware • Error Safe
 # ============================================================
 
 from __future__ import annotations
@@ -16,7 +10,6 @@ from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 import logging
 import math
-import time
 
 import numpy as np
 import pandas as pd
@@ -39,27 +32,19 @@ IST = ZoneInfo("Asia/Kolkata")
 
 NIFTY = "^NSEI"
 
-INTRADAY_INTERVAL = "5m"
-INTRADAY_PERIOD = "5d"
-DAILY_PERIOD = "2y"
-
 DATA_TTL = 45
 DAILY_TTL = 300
 OPTION_TTL = 45
 FUNDAMENTAL_TTL = 3600
+
+INTRADAY_INTERVAL = "5m"
 
 MIN_INTRADAY_CANDLES = 100
 MIN_DAILY_CANDLES = 220
 
 MAX_WORKERS = 5
 
-MARKET_OPEN = dt_time(9, 15)
-MARKET_CLOSE = dt_time(15, 30)
-
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.WARNING)
 
 
 # ============================================================
@@ -140,11 +125,10 @@ if "nifty_last_refresh" not in st.session_state:
 
 
 # ============================================================
-# SAFE HELPERS
+# GENERAL HELPERS
 # ============================================================
 
 def safe_float(value, default=np.nan):
-    """Convert scalar/Series/DataFrame value safely to finite float."""
     try:
         if value is None:
             return default
@@ -161,26 +145,23 @@ def safe_float(value, default=np.nan):
 
         value = float(value)
 
-        return value if np.isfinite(value) else default
+        if np.isfinite(value):
+            return value
 
-    except (TypeError, ValueError, IndexError, OverflowError):
+        return default
+
+    except (TypeError, ValueError, IndexError):
         return default
 
 
 def finite(value):
-    value = safe_float(value)
-    return bool(np.isfinite(value))
-
-
-def positive(value):
-    value = safe_float(value)
-    return bool(np.isfinite(value) and value > 0)
+    return bool(np.isfinite(safe_float(value)))
 
 
 def fmt(value, digits=2):
     value = safe_float(value)
 
-    if not np.isfinite(value):
+    if not finite(value):
         return "-"
 
     return f"{value:,.{digits}f}"
@@ -189,36 +170,17 @@ def fmt(value, digits=2):
 def pct(value, digits=1):
     value = safe_float(value)
 
-    if not np.isfinite(value):
+    if not finite(value):
         return "-"
 
     return f"{value:.{digits}f}%"
 
 
-def clamp(value, low, high):
-    value = safe_float(value)
+def clean_symbol(symbol):
+    if not symbol:
+        return "NIFTY"
 
-    if not finite(value):
-        return np.nan
-
-    return max(low, min(high, value))
-
-
-# ============================================================
-# MARKET STATUS
-# ============================================================
-
-def is_weekday():
-    return datetime.now(IST).weekday() < 5
-
-
-def is_market_open_now():
-    now = datetime.now(IST)
-
-    return (
-        now.weekday() < 5
-        and MARKET_OPEN <= now.time() <= MARKET_CLOSE
-    )
+    return str(symbol).replace(".NS", "")
 
 
 def market_status():
@@ -227,10 +189,19 @@ def market_status():
     if now.weekday() >= 5:
         return "🔴 NSE closed — Weekend"
 
-    if MARKET_OPEN <= now.time() <= MARKET_CLOSE:
+    if dt_time(9, 15) <= now.time() <= dt_time(15, 30):
         return "🟢 NSE market hours"
 
     return "🟡 NSE market closed"
+
+
+def is_market_open_now():
+    now = datetime.now(IST)
+
+    return (
+        now.weekday() < 5
+        and dt_time(9, 15) <= now.time() <= dt_time(15, 30)
+    )
 
 
 # ============================================================
@@ -241,209 +212,139 @@ def clean_ohlcv(data):
     if data is None or data.empty:
         return pd.DataFrame()
 
-    try:
-        df = data.copy()
+    df = data.copy()
 
-        # ----------------------------------------------------
-        # Handle Yahoo MultiIndex safely
-        # ----------------------------------------------------
-        if isinstance(df.columns, pd.MultiIndex):
-            levels = [
-                [str(x) for x in df.columns.get_level_values(i)]
-                for i in range(df.columns.nlevels)
-            ]
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+    ]
 
-            required = {
-                "Open",
-                "High",
-                "Low",
-                "Close",
-                "Volume",
-            }
+    # --------------------------------------------------------
+    # Robust MultiIndex handling
+    # --------------------------------------------------------
 
-            selected = {}
+    if isinstance(df.columns, pd.MultiIndex):
+        flattened = []
 
-            for field in required:
-                found = None
+        for col in df.columns:
+            values = [str(x) for x in col]
 
-                for level in levels:
-                    if field in level:
-                        found = field
-                        break
+            found = None
 
-                if found is not None:
-                    selected[field] = found
+            for item in values:
+                if item in required:
+                    found = item
+                    break
 
-            if len(selected) < 5:
-                # Try flattening as fallback.
-                flat = []
+            flattened.append(
+                found if found is not None else values[-1]
+            )
 
-                for col in df.columns:
-                    parts = [str(x) for x in col]
-                    flat.append("_".join(parts))
+        df.columns = flattened
 
-                df.columns = flat
+    # Remove duplicated columns safely.
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated(keep="last")]
 
-                rename_map = {}
+    if any(col not in df.columns for col in required):
+        return pd.DataFrame()
 
-                for wanted in required:
-                    for col in df.columns:
-                        if col == wanted or col.endswith(f"_{wanted}"):
-                            rename_map[col] = wanted
-                            break
+    df = df[required].copy()
 
-                df = df.rename(columns=rename_map)
+    for col in required:
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce",
+        )
 
-            else:
-                # Pick exact OHLCV fields from whichever MultiIndex
-                # level contains them.
-                new_df = pd.DataFrame(index=df.index)
+    df = df.replace(
+        [np.inf, -np.inf],
+        np.nan,
+    )
 
-                for field in required:
-                    positions = []
-
-                    for i, col in enumerate(df.columns):
-                        if field in [str(x) for x in col]:
-                            positions.append(i)
-
-                    if positions:
-                        new_df[field] = df.iloc[:, positions[0]]
-
-                df = new_df
-
-        # ----------------------------------------------------
-        # Normal single-level columns
-        # ----------------------------------------------------
-        df.columns = [str(c) for c in df.columns]
-
-        required = [
+    df = df.dropna(
+        subset=[
             "Open",
             "High",
             "Low",
             "Close",
-            "Volume",
         ]
+    )
 
-        if not all(col in df.columns for col in required):
-            return pd.DataFrame()
+    df["Volume"] = (
+        df["Volume"]
+        .fillna(0)
+        .clip(lower=0)
+    )
 
-        df = df[required].copy()
+    # Remove impossible OHLC rows.
+    df = df[
+        (df["High"] >= df["Low"])
+        & (df["High"] >= df["Open"])
+        & (df["High"] >= df["Close"])
+        & (df["Low"] <= df["Open"])
+        & (df["Low"] <= df["Close"])
+    ]
 
-        # ----------------------------------------------------
-        # Numeric conversion
-        # ----------------------------------------------------
-        for col in required:
-            df[col] = pd.to_numeric(
-                df[col],
-                errors="coerce",
-            )
+    if isinstance(df.index, pd.DatetimeIndex):
 
-        df = df.replace(
-            [np.inf, -np.inf],
-            np.nan,
-        )
+        try:
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert(IST)
+            else:
+                df.index = df.index.tz_localize(IST)
+        except Exception:
+            pass
 
-        df = df.dropna(
-            subset=[
-                "Open",
-                "High",
-                "Low",
-                "Close",
+        df = (
+            df[
+                ~df.index.duplicated(
+                    keep="last"
+                )
             ]
+            .sort_index()
         )
 
-        df["Volume"] = (
-            df["Volume"]
-            .fillna(0)
-            .clip(lower=0)
-        )
-
-        # ----------------------------------------------------
-        # OHLC sanity
-        # ----------------------------------------------------
-        df = df[
-            (df["High"] >= df["Low"])
-            & (df["High"] >= df["Open"])
-            & (df["High"] >= df["Close"])
-            & (df["Low"] <= df["Open"])
-            & (df["Low"] <= df["Close"])
-        ]
-
-        if isinstance(df.index, pd.DatetimeIndex):
-            try:
-                if df.index.tz is None:
-                    df.index = df.index.tz_localize(
-                        IST,
-                        ambiguous="NaT",
-                        nonexistent="shift_forward",
-                    )
-                else:
-                    df.index = df.index.tz_convert(IST)
-            except Exception:
-                pass
-
-            df = df[
-                ~df.index.duplicated(keep="last")
-            ].sort_index()
-
-        return df
-
-    except Exception as exc:
-        logging.warning(
-            "OHLCV cleaning failed: %s",
-            exc,
-        )
-        return pd.DataFrame()
+    return df
 
 
 # ============================================================
-# SYMBOL EXTRACTION
+# BATCH SYMBOL EXTRACTION
 # ============================================================
 
 def extract_symbol(raw, symbol):
+
     if raw is None or raw.empty:
         return pd.DataFrame()
 
     try:
+
         if isinstance(raw.columns, pd.MultiIndex):
 
-            # Case 1:
-            # ticker is first level
-            if symbol in raw.columns.get_level_values(0):
-                return clean_ohlcv(
-                    raw.xs(
-                        symbol,
-                        axis=1,
-                        level=0,
-                        drop_level=True,
-                    )
+            level0 = list(
+                raw.columns.get_level_values(0)
+            )
+
+            level1 = list(
+                raw.columns.get_level_values(1)
+            )
+
+            # Case: ticker is first level.
+            if symbol in level0:
+                selected = raw[symbol]
+                return clean_ohlcv(selected)
+
+            # Case: ticker is second level.
+            if symbol in level1:
+                selected = raw.xs(
+                    symbol,
+                    axis=1,
+                    level=1,
                 )
-
-            # Case 2:
-            # ticker is second level
-            if symbol in raw.columns.get_level_values(1):
-                return clean_ohlcv(
-                    raw.xs(
-                        symbol,
-                        axis=1,
-                        level=1,
-                        drop_level=True,
-                    )
-                )
-
-            # Case 3: search each column tuple
-            matching = []
-
-            for col in raw.columns:
-                if symbol in [str(x) for x in col]:
-                    matching.append(col)
-
-            if matching:
-                return clean_ohlcv(
-                    raw.loc[:, matching]
-                )
-
-            return pd.DataFrame()
+                return clean_ohlcv(selected)
 
         return clean_ohlcv(raw)
 
@@ -453,11 +354,12 @@ def extract_symbol(raw, symbol):
             symbol,
             exc,
         )
+
         return pd.DataFrame()
 
 
 # ============================================================
-# YAHOO DOWNLOAD
+# YAHOO DOWNLOAD ENGINE
 # ============================================================
 
 def _download_batch(
@@ -465,9 +367,10 @@ def _download_batch(
     period,
     interval,
 ):
+
     symbols = tuple(
         dict.fromkeys(
-            str(s) for s in symbols if s
+            str(x) for x in symbols if x
         )
     )
 
@@ -475,6 +378,7 @@ def _download_batch(
         return {}
 
     try:
+
         raw = yf.download(
             tickers=list(symbols),
             period=period,
@@ -483,14 +387,15 @@ def _download_batch(
             auto_adjust=False,
             threads=True,
             group_by="ticker",
-            prepost=False,
         )
 
     except Exception as exc:
+
         logging.warning(
-            "Yahoo batch download failed: %s",
+            "Yahoo download failed: %s",
             exc,
         )
+
         return {}
 
     result = {}
@@ -502,21 +407,14 @@ def _download_batch(
     )
 
     for symbol in symbols:
-        try:
-            df = extract_symbol(
-                raw,
-                symbol,
-            )
 
-            if len(df) >= minimum:
-                result[symbol] = df
+        df = extract_symbol(
+            raw,
+            symbol,
+        )
 
-        except Exception as exc:
-            logging.warning(
-                "Data processing failed for %s: %s",
-                symbol,
-                exc,
-            )
+        if len(df) >= minimum:
+            result[symbol] = df
 
     return result
 
@@ -526,9 +424,10 @@ def _download_batch(
     show_spinner=False,
 )
 def download_intraday_batch(symbols):
+
     return _download_batch(
         tuple(symbols),
-        INTRADAY_PERIOD,
+        "5d",
         INTRADAY_INTERVAL,
     )
 
@@ -538,9 +437,10 @@ def download_intraday_batch(symbols):
     show_spinner=False,
 )
 def download_daily_batch(symbols):
+
     return _download_batch(
         tuple(symbols),
-        DAILY_PERIOD,
+        "2y",
         "1d",
     )
 
@@ -550,6 +450,7 @@ def download_daily_batch(symbols):
     show_spinner=False,
 )
 def get_nifty_intraday():
+
     data = download_intraday_batch(
         (NIFTY,)
     )
@@ -565,6 +466,7 @@ def get_nifty_intraday():
     show_spinner=False,
 )
 def get_nifty_daily():
+
     data = download_daily_batch(
         (NIFTY,)
     )
@@ -576,35 +478,25 @@ def get_nifty_daily():
 
 
 # ============================================================
-# COMPLETED CANDLE
+# COMPLETED CANDLE ENGINE
 # ============================================================
 
 def get_completed_intraday_df(df):
-    """
-    Return only completed 5-minute candles.
 
-    Yahoo may return the currently forming candle during
-    market hours. That candle is removed.
-
-    After market close we retain the latest candle because
-    it should already represent the completed session.
-    """
-
-    if df is None or df.empty:
+    if df is None or len(df) < 3:
         return pd.DataFrame()
 
     out = df.copy()
 
-    if len(out) < 3:
-        return pd.DataFrame()
-
-    if not isinstance(out.index, pd.DatetimeIndex):
+    if not isinstance(
+        out.index,
+        pd.DatetimeIndex,
+    ):
         return out.iloc[:-1].copy()
 
-    try:
-        out = out.sort_index()
+    now = datetime.now(IST)
 
-        now = datetime.now(IST)
+    try:
 
         last_ts = out.index[-1]
 
@@ -617,49 +509,41 @@ def get_completed_intraday_df(df):
                 IST
             )
 
-        # During market hours the last 5-minute bucket
-        # is potentially still forming.
-        if is_market_open_now():
-
-            bucket_minute = (
-                now.minute // 5
-            ) * 5
-
-            current_bucket = now.replace(
-                minute=bucket_minute,
-                second=0,
-                microsecond=0,
-            )
-
-            if last_ts >= current_bucket:
-                out = out.iloc[:-1].copy()
-
-        # Extra protection:
-        # don't use future timestamps.
-        out = out[
-            out.index <= now
-        ].copy()
-
-        return out
-
-    except Exception as exc:
-        logging.warning(
-            "Completed candle handling failed: %s",
-            exc,
-        )
+    except Exception:
 
         return out.iloc[:-1].copy()
+
+    # Outside market hours, Yahoo normally
+    # gives the last completed candle.
+    if not is_market_open_now():
+        return out
+
+    bucket_minute = (
+        now.minute // 5
+    ) * 5
+
+    current_bucket = now.replace(
+        minute=bucket_minute,
+        second=0,
+        microsecond=0,
+    )
+
+    # If the last timestamp is in the current
+    # forming 5-minute bucket, remove it.
+    if last_ts >= current_bucket:
+        return out.iloc[:-1].copy()
+
+    return out
 
 
 # ============================================================
 # RSI
 # ============================================================
 
-def rsi_wilder(close, period=14):
-    close = pd.to_numeric(
-        close,
-        errors="coerce",
-    )
+def rsi_wilder(
+    close,
+    period=14,
+):
 
     change = close.diff()
 
@@ -683,32 +567,19 @@ def rsi_wilder(close, period=14):
         min_periods=period,
     ).mean()
 
-    rsi = pd.Series(
-        np.nan,
-        index=close.index,
-        dtype=float,
+    rs = (
+        avg_gain
+        / avg_loss.replace(
+            0,
+            np.nan,
+        )
     )
 
-    normal = (
-        avg_loss > 0
-    ) & avg_gain.notna()
-
-    rs = pd.Series(
-        np.nan,
-        index=close.index,
-        dtype=float,
-    )
-
-    rs.loc[normal] = (
-        avg_gain.loc[normal]
-        / avg_loss.loc[normal]
-    )
-
-    rsi.loc[normal] = (
+    rsi = (
         100
         - (
             100
-            / (1 + rs.loc[normal])
+            / (1 + rs)
         )
     )
 
@@ -731,38 +602,11 @@ def rsi_wilder(close, period=14):
 
 
 # ============================================================
-# ATR
-# ============================================================
-
-def atr_wilder(
-    high,
-    low,
-    close,
-    period=14,
-):
-    previous_close = close.shift(1)
-
-    tr = pd.concat(
-        [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    return tr.ewm(
-        alpha=1 / period,
-        adjust=False,
-        min_periods=period,
-    ).mean()
-
-
-# ============================================================
 # INTRADAY INDICATORS
 # ============================================================
 
 def calculate_intraday_indicators(df):
+
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -778,7 +622,7 @@ def calculate_intraday_indicators(df):
     )
 
     # --------------------------------------------------------
-    # EMAs
+    # EMA
     # --------------------------------------------------------
 
     for span in (
@@ -787,6 +631,7 @@ def calculate_intraday_indicators(df):
         50,
         200,
     ):
+
         df[f"EMA{span}"] = (
             close
             .ewm(
@@ -810,12 +655,28 @@ def calculate_intraday_indicators(df):
     # ATR
     # --------------------------------------------------------
 
-    df["ATR"] = atr_wilder(
-        high,
-        low,
-        close,
-        14,
-    )
+    previous_close = close.shift(1)
+
+    tr = pd.concat(
+        [
+            high - low,
+            (
+                high
+                - previous_close
+            ).abs(),
+            (
+                low
+                - previous_close
+            ).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    df["ATR"] = tr.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
 
     # --------------------------------------------------------
     # SESSION VWAP
@@ -836,21 +697,22 @@ def calculate_intraday_indicators(df):
         df.index,
         pd.DatetimeIndex,
     ):
-        session_key = pd.Series(
+
+        session = pd.Series(
             df.index.date,
             index=df.index,
         )
 
         cumulative_pv = (
-            pv.groupby(
-                session_key
-            ).cumsum()
+            pv
+            .groupby(session)
+            .cumsum()
         )
 
         cumulative_volume = (
-            volume.groupby(
-                session_key
-            ).cumsum()
+            volume
+            .groupby(session)
+            .cumsum()
         )
 
         df["VWAP"] = (
@@ -862,6 +724,7 @@ def calculate_intraday_indicators(df):
         )
 
     else:
+
         df["VWAP"] = (
             pv.cumsum()
             / volume.cumsum().replace(
@@ -871,7 +734,7 @@ def calculate_intraday_indicators(df):
         )
 
     # --------------------------------------------------------
-    # RELATIVE VOLUME
+    # VOLUME
     # --------------------------------------------------------
 
     df["VOL_AVG20"] = (
@@ -886,12 +749,13 @@ def calculate_intraday_indicators(df):
 
     df["VOL_RATIO"] = np.where(
         df["VOL_AVG20"] > 0,
-        volume / df["VOL_AVG20"],
+        volume
+        / df["VOL_AVG20"],
         np.nan,
     )
 
     # --------------------------------------------------------
-    # BREAKOUT LEVELS
+    # BREAKOUT
     # --------------------------------------------------------
 
     df["HIGH10"] = (
@@ -939,14 +803,12 @@ def calculate_intraday_indicators(df):
     # --------------------------------------------------------
 
     df["ROC5"] = (
-        close
-        .pct_change(5)
+        close.pct_change(5)
         * 100
     )
 
     df["ROC10"] = (
-        close
-        .pct_change(10)
+        close.pct_change(10)
         * 100
     )
 
@@ -963,14 +825,16 @@ def calculate_intraday_indicators(df):
 
     df["BODY_PCT"] = (
         (
-            close - df["Open"]
+            close
+            - df["Open"]
         ).abs()
         / candle_range
     )
 
     df["CLOSE_LOCATION"] = (
         (
-            close - low
+            close
+            - low
         )
         / candle_range
     )
@@ -983,6 +847,7 @@ def calculate_intraday_indicators(df):
 # ============================================================
 
 def calculate_daily_indicators(df):
+
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -1047,56 +912,60 @@ BEAR_WEIGHTS = {
     "Strong bearish candle": 0.80,
 }
 
-MAX_SCORE = sum(BULL_WEIGHTS.values())
+MAX_SCORE = sum(
+    BULL_WEIGHTS.values()
+)
 
-
-# ============================================================
-# SIGNAL CLASSIFICATION
-# ============================================================
 
 def classify_signal(
     bull_pct,
     bear_pct,
 ):
-    bull_pct = safe_float(bull_pct, 0)
-    bear_pct = safe_float(bear_pct, 0)
 
-    edge = bull_pct - bear_pct
-    difference = abs(edge)
+    if not finite(bull_pct):
+        return "NO EDGE"
+
+    if not finite(bear_pct):
+        return "NO EDGE"
+
+    difference = abs(
+        bull_pct
+        - bear_pct
+    )
 
     if (
         bull_pct >= 72
-        and edge >= 18
+        and difference >= 18
     ):
         return "STRONG BUY"
 
     if (
         bull_pct >= 62
-        and edge >= 12
+        and difference >= 12
     ):
         return "BUY WATCH"
 
     if (
         bear_pct >= 72
-        and edge <= -18
+        and difference >= 18
     ):
         return "STRONG SELL"
 
     if (
         bear_pct >= 62
-        and edge <= -12
+        and difference >= 12
     ):
         return "SELL WATCH"
 
     if (
         bull_pct >= 52
-        and edge > 0
+        and bull_pct > bear_pct
     ):
         return "WATCH BUY"
 
     if (
         bear_pct >= 52
-        and edge < 0
+        and bear_pct > bull_pct
     ):
         return "WATCH SELL"
 
@@ -1112,6 +981,7 @@ def analyze_frame(
     daily,
     symbol=None,
 ):
+
     if (
         intraday is None
         or daily is None
@@ -1120,507 +990,374 @@ def analyze_frame(
     ):
         return None
 
-    try:
-        # ----------------------------------------------------
-        # Completed candles FIRST
-        # ----------------------------------------------------
+    # Calculate indicators BEFORE
+    # removing forming candle.
+    intraday = calculate_intraday_indicators(
+        intraday
+    )
 
-        intraday = get_completed_intraday_df(
-            intraday
+    daily = calculate_daily_indicators(
+        daily
+    )
+
+    intraday = get_completed_intraday_df(
+        intraday
+    )
+
+    if (
+        len(intraday)
+        < MIN_INTRADAY_CANDLES
+    ):
+        return None
+
+    if (
+        len(daily)
+        < MIN_DAILY_CANDLES
+    ):
+        return None
+
+    last = intraday.iloc[-1]
+    previous = intraday.iloc[-2]
+
+    daily_last = daily.iloc[-1]
+
+    price = safe_float(
+        last["Close"]
+    )
+
+    if not finite(price):
+        return None
+
+    indicator_names = [
+        "VWAP",
+        "EMA9",
+        "EMA20",
+        "EMA50",
+        "EMA200",
+        "RSI",
+        "ATR",
+        "ROC5",
+        "ROC10",
+        "VOL_RATIO",
+        "HIGH10",
+        "LOW10",
+        "BODY_PCT",
+        "CLOSE_LOCATION",
+    ]
+
+    values = {
+        name: safe_float(
+            last[name]
         )
+        for name in indicator_names
+    }
 
-        if len(intraday) < MIN_INTRADAY_CANDLES:
-            return None
-
-        if len(daily) < MIN_DAILY_CANDLES:
-            return None
-
-        # ----------------------------------------------------
-        # Indicators
-        # ----------------------------------------------------
-
-        intraday = calculate_intraday_indicators(
-            intraday
-        )
-
-        daily = calculate_daily_indicators(
-            daily
-        )
-
-        if intraday.empty or daily.empty:
-            return None
-
-        last = intraday.iloc[-1]
-        previous = intraday.iloc[-2]
-        daily_last = daily.iloc[-1]
-
-        price = safe_float(
-            last["Close"]
-        )
-
-        if not positive(price):
-            return None
-
-        # ----------------------------------------------------
-        # Indicator values
-        # ----------------------------------------------------
-
-        indicator_names = [
-            "VWAP",
-            "EMA9",
-            "EMA20",
-            "EMA50",
-            "EMA200",
-            "RSI",
-            "ATR",
-            "ROC5",
-            "ROC10",
-            "VOL_RATIO",
-            "HIGH10",
-            "LOW10",
-            "BODY_PCT",
-            "CLOSE_LOCATION",
+    daily_ema200 = safe_float(
+        daily_last[
+            "EMA200_DAILY"
         ]
+    )
 
-        values = {
-            name: safe_float(
-                last[name]
-            )
-            for name in indicator_names
-        }
+    previous_ema20 = safe_float(
+        previous["EMA20"]
+    )
 
-        daily_ema200 = safe_float(
-            daily_last["EMA200_DAILY"]
-        )
+    previous_ema50 = safe_float(
+        previous["EMA50"]
+    )
 
-        previous_ema20 = safe_float(
-            previous["EMA20"]
-        )
+    open_price = safe_float(
+        last["Open"]
+    )
 
-        previous_ema50 = safe_float(
-            previous["EMA50"]
-        )
+    # --------------------------------------------------------
+    # BULLISH
+    # --------------------------------------------------------
 
-        open_price = safe_float(
-            last["Open"]
-        )
+    bullish = {
 
-        # ----------------------------------------------------
-        # Bullish conditions
-        # ----------------------------------------------------
+        "Price above VWAP":
+            finite(values["VWAP"])
+            and price > values["VWAP"],
 
-        bullish = {
-            "Price above VWAP": (
-                finite(values["VWAP"])
-                and price > values["VWAP"]
-            ),
+        "EMA9 > EMA20":
+            finite(values["EMA9"])
+            and finite(values["EMA20"])
+            and values["EMA9"]
+            > values["EMA20"],
 
-            "EMA9 > EMA20": (
-                finite(values["EMA9"])
-                and finite(values["EMA20"])
-                and values["EMA9"]
-                > values["EMA20"]
-            ),
+        "EMA20 > EMA50":
+            finite(values["EMA20"])
+            and finite(values["EMA50"])
+            and values["EMA20"]
+            > values["EMA50"],
 
-            "EMA20 > EMA50": (
-                finite(values["EMA20"])
-                and finite(values["EMA50"])
-                and values["EMA20"]
-                > values["EMA50"]
-            ),
+        "EMA20 rising":
+            finite(values["EMA20"])
+            and finite(previous_ema20)
+            and values["EMA20"]
+            > previous_ema20,
 
-            "EMA20 rising": (
-                finite(values["EMA20"])
-                and finite(previous_ema20)
-                and values["EMA20"]
-                > previous_ema20
-            ),
+        "EMA50 rising":
+            finite(values["EMA50"])
+            and finite(previous_ema50)
+            and values["EMA50"]
+            > previous_ema50,
 
-            "EMA50 rising": (
-                finite(values["EMA50"])
-                and finite(previous_ema50)
-                and values["EMA50"]
-                > previous_ema50
-            ),
+        "Above daily EMA200":
+            finite(daily_ema200)
+            and price > daily_ema200,
 
-            "Above daily EMA200": (
-                finite(daily_ema200)
-                and price > daily_ema200
-            ),
+        "RSI 52-72":
+            finite(values["RSI"])
+            and 52
+            <= values["RSI"]
+            <= 72,
 
-            "RSI 52-72": (
-                finite(values["RSI"])
-                and 52 <= values["RSI"] <= 72
-            ),
+        "ROC5 positive":
+            finite(values["ROC5"])
+            and values["ROC5"] > 0,
 
-            "ROC5 positive": (
-                finite(values["ROC5"])
-                and values["ROC5"] > 0
-            ),
+        "ROC10 positive":
+            finite(values["ROC10"])
+            and values["ROC10"] > 0,
 
-            "ROC10 positive": (
-                finite(values["ROC10"])
-                and values["ROC10"] > 0
-            ),
+        "Volume >= 1.2x":
+            finite(values["VOL_RATIO"])
+            and values["VOL_RATIO"]
+            >= 1.20,
 
-            "Volume >= 1.2x": (
-                finite(values["VOL_RATIO"])
-                and values["VOL_RATIO"] >= 1.20
-            ),
+        "10-candle breakout":
+            finite(values["HIGH10"])
+            and price > values["HIGH10"],
 
-            "10-candle breakout": (
-                finite(values["HIGH10"])
-                and price > values["HIGH10"]
-            ),
-
-            "Strong bullish candle": (
+        "Strong bullish candle":
+            (
                 finite(open_price)
                 and price > open_price
                 and finite(values["BODY_PCT"])
-                and finite(values["CLOSE_LOCATION"])
-                and values["BODY_PCT"] >= 0.45
-                and values["CLOSE_LOCATION"] >= 0.65
+                and finite(
+                    values["CLOSE_LOCATION"]
+                )
+                and values["BODY_PCT"]
+                >= 0.45
+                and values["CLOSE_LOCATION"]
+                >= 0.65
             ),
-        }
+    }
 
-        # ----------------------------------------------------
-        # Bearish conditions
-        # ----------------------------------------------------
+    # --------------------------------------------------------
+    # BEARISH
+    # --------------------------------------------------------
 
-        bearish = {
-            "Price below VWAP": (
-                finite(values["VWAP"])
-                and price < values["VWAP"]
-            ),
+    bearish = {
 
-            "EMA9 < EMA20": (
-                finite(values["EMA9"])
-                and finite(values["EMA20"])
-                and values["EMA9"]
-                < values["EMA20"]
-            ),
+        "Price below VWAP":
+            finite(values["VWAP"])
+            and price < values["VWAP"],
 
-            "EMA20 < EMA50": (
-                finite(values["EMA20"])
-                and finite(values["EMA50"])
-                and values["EMA20"]
-                < values["EMA50"]
-            ),
+        "EMA9 < EMA20":
+            finite(values["EMA9"])
+            and finite(values["EMA20"])
+            and values["EMA9"]
+            < values["EMA20"],
 
-            "EMA20 falling": (
-                finite(values["EMA20"])
-                and finite(previous_ema20)
-                and values["EMA20"]
-                < previous_ema20
-            ),
+        "EMA20 < EMA50":
+            finite(values["EMA20"])
+            and finite(values["EMA50"])
+            and values["EMA20"]
+            < values["EMA50"],
 
-            "EMA50 falling": (
-                finite(values["EMA50"])
-                and finite(previous_ema50)
-                and values["EMA50"]
-                < previous_ema50
-            ),
+        "EMA20 falling":
+            finite(values["EMA20"])
+            and finite(previous_ema20)
+            and values["EMA20"]
+            < previous_ema20,
 
-            "Below daily EMA200": (
-                finite(daily_ema200)
-                and price < daily_ema200
-            ),
+        "EMA50 falling":
+            finite(values["EMA50"])
+            and finite(previous_ema50)
+            and values["EMA50"]
+            < previous_ema50,
 
-            "RSI 28-48": (
-                finite(values["RSI"])
-                and 28 <= values["RSI"] <= 48
-            ),
+        "Below daily EMA200":
+            finite(daily_ema200)
+            and price < daily_ema200,
 
-            "ROC5 negative": (
-                finite(values["ROC5"])
-                and values["ROC5"] < 0
-            ),
+        "RSI 28-48":
+            finite(values["RSI"])
+            and 28
+            <= values["RSI"]
+            <= 48,
 
-            "ROC10 negative": (
-                finite(values["ROC10"])
-                and values["ROC10"] < 0
-            ),
+        "ROC5 negative":
+            finite(values["ROC5"])
+            and values["ROC5"] < 0,
 
-            "Volume >= 1.2x": (
-                finite(values["VOL_RATIO"])
-                and values["VOL_RATIO"] >= 1.20
-            ),
+        "ROC10 negative":
+            finite(values["ROC10"])
+            and values["ROC10"] < 0,
 
-            "10-candle breakdown": (
-                finite(values["LOW10"])
-                and price < values["LOW10"]
-            ),
+        "Volume >= 1.2x":
+            finite(values["VOL_RATIO"])
+            and values["VOL_RATIO"]
+            >= 1.20,
 
-            "Strong bearish candle": (
+        "10-candle breakdown":
+            finite(values["LOW10"])
+            and price < values["LOW10"],
+
+        "Strong bearish candle":
+            (
                 finite(open_price)
                 and price < open_price
                 and finite(values["BODY_PCT"])
-                and finite(values["CLOSE_LOCATION"])
-                and values["BODY_PCT"] >= 0.45
-                and values["CLOSE_LOCATION"] <= 0.35
+                and finite(
+                    values["CLOSE_LOCATION"]
+                )
+                and values["BODY_PCT"]
+                >= 0.45
+                and values["CLOSE_LOCATION"]
+                <= 0.35
             ),
-        }
+    }
 
-        # ----------------------------------------------------
-        # Scores
-        #
-        # IMPORTANT:
-        # Score is based only on conditions whose required
-        # indicators exist. Missing data is NOT treated as
-        # bearish or bullish.
-        # ----------------------------------------------------
+    # --------------------------------------------------------
+    # SCORES
+    # --------------------------------------------------------
 
-        bull_available = sum(
-            BULL_WEIGHTS[key]
-            for key, condition in bullish.items()
-            if (
-                condition
-                or key not in {
-                    "Price above VWAP",
-                    "EMA9 > EMA20",
-                    "EMA20 > EMA50",
-                    "EMA20 rising",
-                    "EMA50 rising",
-                    "Above daily EMA200",
-                    "RSI 52-72",
-                    "ROC5 positive",
-                    "ROC10 positive",
-                    "Volume >= 1.2x",
-                    "10-candle breakout",
-                    "Strong bullish candle",
-                }
-            )
-        )
-
-        bear_available = sum(
-            BEAR_WEIGHTS[key]
-            for key, condition in bearish.items()
-            if (
-                condition
-                or key not in {
-                    "Price below VWAP",
-                    "EMA9 < EMA20",
-                    "EMA20 < EMA50",
-                    "EMA20 falling",
-                    "EMA50 falling",
-                    "Below daily EMA200",
-                    "RSI 28-48",
-                    "ROC5 negative",
-                    "ROC10 negative",
-                    "Volume >= 1.2x",
-                    "10-candle breakdown",
-                    "Strong bearish candle",
-                }
-            )
-        )
-
-        # In this model all conditions have a defined value.
-        # Keep the explicit denominator stable for ranking.
-        bull_score = sum(
-            BULL_WEIGHTS[key]
-            for key, condition in bullish.items()
-            if condition
-        )
-
-        bear_score = sum(
-            BEAR_WEIGHTS[key]
-            for key, condition in bearish.items()
-            if condition
-        )
-
-        bull_pct = (
-            bull_score / MAX_SCORE
-        ) * 100
-
-        bear_pct = (
-            bear_score / MAX_SCORE
-        ) * 100
-
-        score_difference = (
-            bull_pct - bear_pct
-        )
-
-        signal = classify_signal(
-            bull_pct,
-            bear_pct,
-        )
-
-        symbol_name = (
-            symbol.replace(".NS", "")
-            if symbol
-            else "NIFTY"
-        )
-
-        return {
-            "symbol": symbol_name,
-            "ticker": symbol if symbol else NIFTY,
-
-            "price": price,
-
-            "bull_score": bull_pct,
-            "bear_score": bear_pct,
-            "score": score_difference,
-
-            "signal": signal,
-
-            "rsi": values["RSI"],
-            "vwap": values["VWAP"],
-
-            "ema9": values["EMA9"],
-            "ema20": values["EMA20"],
-            "ema50": values["EMA50"],
-            "ema200_intraday": values["EMA200"],
-
-            "daily_ema200": daily_ema200,
-
-            "atr": values["ATR"],
-
-            "roc5": values["ROC5"],
-            "roc10": values["ROC10"],
-
-            "volume_ratio": values["VOL_RATIO"],
-
-            "bullish": bullish,
-            "bearish": bearish,
-
-            "reasons": [
-                key
-                for key, value in bullish.items()
-                if value
-            ],
-
-            "warnings": [
-                key
-                for key, value in bearish.items()
-                if value
-            ],
-
-            "candle_time": intraday.index[-1],
-
-            "chart_df": intraday,
-        }
-
-    except Exception as exc:
-        logging.warning(
-            "Frame analysis failed for %s: %s",
-            symbol,
-            exc,
-        )
-        return None
-
-
-# ============================================================
-# DAY CHANGE
-# ============================================================
-
-def calculate_day_change(
-    daily_df,
-    current_price,
-):
-    if (
-        daily_df is None
-        or daily_df.empty
-    ):
-        return np.nan
-
-    current_price = safe_float(
-        current_price
+    bull_score = sum(
+        BULL_WEIGHTS[key]
+        for key, value in bullish.items()
+        if value
     )
 
-    if not positive(current_price):
-        return np.nan
+    bear_score = sum(
+        BEAR_WEIGHTS[key]
+        for key, value in bearish.items()
+        if value
+    )
 
-    df = daily_df.copy()
+    bull_pct = (
+        bull_score
+        / MAX_SCORE
+    ) * 100
 
-    try:
-        if isinstance(
-            df.index,
-            pd.DatetimeIndex,
-        ):
-            dates = [
-                ts.date()
-                for ts in df.index
-            ]
+    bear_pct = (
+        bear_score
+        / MAX_SCORE
+    ) * 100
 
-            today = datetime.now(
-                IST
-            ).date()
+    score_difference = (
+        bull_pct
+        - bear_pct
+    )
 
-            if today in dates:
-                idx = dates.index(today)
+    signal = classify_signal(
+        bull_pct,
+        bear_pct,
+    )
 
-                if idx > 0:
-                    previous_close = safe_float(
-                        df.iloc[idx - 1]["Close"]
-                    )
+    # Strong signal is invalid if opposite
+    # side is also very strong.
+    if (
+        signal == "STRONG BUY"
+        and bear_pct >= 55
+    ):
+        signal = "NO EDGE"
 
-                    if positive(previous_close):
-                        return (
-                            (
-                                current_price
-                                / previous_close
-                            ) - 1
-                        ) * 100
+    if (
+        signal == "STRONG SELL"
+        and bull_pct >= 55
+    ):
+        signal = "NO EDGE"
 
-            # Latest available daily candle may be
-            # today's close after market close.
-            if len(df) >= 2:
-                previous_close = safe_float(
-                    df.iloc[-2]["Close"]
-                )
+    return {
 
-                if positive(previous_close):
-                    latest_date = (
-                        df.index[-1].date()
-                        if isinstance(
-                            df.index[-1],
-                            pd.Timestamp,
-                        )
-                        else None
-                    )
+        "symbol": clean_symbol(
+            symbol
+        ),
 
-                    if (
-                        latest_date != today
-                        or not is_market_open_now()
-                    ):
-                        return (
-                            (
-                                current_price
-                                / previous_close
-                            ) - 1
-                        ) * 100
+        "ticker": (
+            symbol
+            if symbol
+            else NIFTY
+        ),
 
-        previous_close = safe_float(
-            df.iloc[-1]["Close"]
-        )
+        "price": price,
 
-        if positive(previous_close):
-            return (
-                (
-                    current_price
-                    / previous_close
-                ) - 1
-            ) * 100
+        "bull_score": bull_pct,
 
-    except Exception as exc:
-        logging.warning(
-            "Day change calculation failed: %s",
-            exc,
-        )
+        "bear_score": bear_pct,
 
-    return np.nan
+        "score": score_difference,
 
+        "signal": signal,
 
-# ============================================================
-# STOCK ANALYSIS
-# ============================================================
+        "rsi": values["RSI"],
+
+        "vwap": values["VWAP"],
+
+        "ema9": values["EMA9"],
+
+        "ema20": values["EMA20"],
+
+        "ema50": values["EMA50"],
+
+        "ema200_intraday":
+            values["EMA200"],
+
+        "daily_ema200":
+            daily_ema200,
+
+        "atr":
+            values["ATR"],
+
+        "roc5":
+            values["ROC5"],
+
+        "roc10":
+            values["ROC10"],
+
+        "volume_ratio":
+            values["VOL_RATIO"],
+
+        "bullish":
+            bullish,
+
+        "bearish":
+            bearish,
+
+        "reasons": [
+            key
+            for key, value
+            in bullish.items()
+            if value
+        ],
+
+        "warnings": [
+            key
+            for key, value
+            in bearish.items()
+            if value
+        ],
+
+        "candle_time":
+            intraday.index[-1],
+
+        "chart_df":
+            intraday,
+    }
+
 
 def analyze_stock(
     symbol,
     intraday,
     daily,
 ):
+
     try:
+
         result = analyze_frame(
             intraday,
             daily,
@@ -1640,36 +1377,115 @@ def analyze_stock(
         return result
 
     except Exception as exc:
+
         logging.warning(
-            "Stock analysis failed for %s: %s",
+            "Analysis failed for %s: %s",
             symbol,
             exc,
         )
+
         return None
 
 
 # ============================================================
-# ATM
+# DAY CHANGE
+# ============================================================
+
+def calculate_day_change(
+    daily_df,
+    current_price,
+):
+
+    price = safe_float(
+        current_price
+    )
+
+    if (
+        daily_df is None
+        or daily_df.empty
+        or not finite(price)
+    ):
+        return np.nan
+
+    df = daily_df.copy()
+
+    previous_close = np.nan
+
+    if isinstance(
+        df.index,
+        pd.DatetimeIndex,
+    ):
+
+        dates = [
+            item.date()
+            for item in df.index
+        ]
+
+        today = datetime.now(
+            IST
+        ).date()
+
+        if today in dates:
+
+            index = dates.index(
+                today
+            )
+
+            if index > 0:
+
+                previous_close = safe_float(
+                    df.iloc[
+                        index - 1
+                    ]["Close"]
+                )
+
+    if not finite(previous_close):
+
+        previous_close = safe_float(
+            df.iloc[-1]["Close"]
+        )
+
+    if (
+        not finite(previous_close)
+        or previous_close <= 0
+    ):
+        return np.nan
+
+    return (
+        (
+            price
+            / previous_close
+        )
+        - 1
+    ) * 100
+
+
+# ============================================================
+# NIFTY ATM
 # ============================================================
 
 def get_atm(price):
+
     price = safe_float(price)
 
-    if not positive(price):
+    if not finite(price):
         return np.nan
 
     return int(
         math.floor(
-            (price / 50) + 0.5
-        ) * 50
+            price / 50
+            + 0.5
+        )
+        * 50
     )
 
 
 # ============================================================
-# OPTIONS CLEANING
+# OPTION CHAIN
 # ============================================================
 
 def clean_options(df):
+
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -1688,7 +1504,9 @@ def clean_options(df):
     ]
 
     for col in numeric_columns:
+
         if col in out.columns:
+
             out[col] = pd.to_numeric(
                 out[col],
                 errors="coerce",
@@ -1698,8 +1516,9 @@ def clean_options(df):
         "volume",
         "openInterest",
     ]:
+
         if col not in out.columns:
-            out[col] = 0
+            out[col] = 0.0
 
         out[col] = (
             out[col]
@@ -1707,19 +1526,23 @@ def clean_options(df):
             .clip(lower=0)
         )
 
+    if "strike" in out.columns:
+
+        out = out[
+            out["strike"].notna()
+        ].copy()
+
     return out
 
-
-# ============================================================
-# OPTION CHAIN
-# ============================================================
 
 @st.cache_data(
     ttl=OPTION_TTL,
     show_spinner=False,
 )
 def get_nifty_options():
+
     try:
+
         ticker = yf.Ticker(
             NIFTY
         )
@@ -1729,6 +1552,7 @@ def get_nifty_options():
         )
 
         if not expirations:
+
             return (
                 None,
                 pd.DataFrame(),
@@ -1736,11 +1560,44 @@ def get_nifty_options():
                 [],
             )
 
-        expirations = sorted(
-            set(expirations)
+        today = datetime.now(
+            IST
+        ).date()
+
+        valid_expiries = []
+
+        for expiry in expirations:
+
+            try:
+
+                expiry_date = (
+                    pd.Timestamp(
+                        expiry
+                    ).date()
+                )
+
+                if expiry_date >= today:
+                    valid_expiries.append(
+                        expiry
+                    )
+
+            except Exception:
+                continue
+
+        if not valid_expiries:
+
+            return (
+                None,
+                pd.DataFrame(),
+                pd.DataFrame(),
+                [],
+            )
+
+        valid_expiries = sorted(
+            valid_expiries
         )
 
-        expiry = expirations[0]
+        expiry = valid_expiries[0]
 
         chain = ticker.option_chain(
             expiry
@@ -1758,10 +1615,11 @@ def get_nifty_options():
             expiry,
             calls,
             puts,
-            expirations,
+            valid_expiries,
         )
 
     except Exception as exc:
+
         logging.warning(
             "Option chain failed: %s",
             exc,
@@ -1784,6 +1642,7 @@ def select_option(
     atm,
     direction,
 ):
+
     if (
         df is None
         or df.empty
@@ -1791,177 +1650,179 @@ def select_option(
     ):
         return None
 
-    try:
-        work = df.copy()
+    required = [
+        "strike",
+        "lastPrice",
+        "bid",
+        "ask",
+        "volume",
+        "openInterest",
+    ]
 
-        required = [
-            "strike",
-            "lastPrice",
-            "bid",
-            "ask",
-            "volume",
-            "openInterest",
-        ]
+    for col in required:
 
-        for col in required:
-            if col not in work.columns:
-                work[col] = 0
-
-            work[col] = pd.to_numeric(
-                work[col],
-                errors="coerce",
-            ).fillna(0)
-
-        work = work[
-            work["strike"] > 0
-        ].copy()
-
-        if work.empty:
+        if col not in df.columns:
             return None
 
-        work["distance"] = (
-            work["strike"] - atm
-        ).abs()
+    work = df.copy()
 
-        # Maximum 300 points from ATM.
-        work = work[
-            work["distance"] <= 300
-        ].copy()
+    work = work[
+        work["strike"].notna()
+    ].copy()
 
-        if work.empty:
-            return None
-
-        # ----------------------------------------------------
-        # Direction-specific strike window
-        # ----------------------------------------------------
-
-        if direction == "CE":
-            work = work[
-                (work["strike"] >= atm - 50)
-                & (work["strike"] <= atm + 100)
-            ].copy()
-
-        elif direction == "PE":
-            work = work[
-                (work["strike"] >= atm - 100)
-                & (work["strike"] <= atm + 50)
-            ].copy()
-
-        else:
-            return None
-
-        if work.empty:
-            return None
-
-        bid = work["bid"]
-        ask = work["ask"]
-        last_price = work["lastPrice"]
-
-        valid_market = (
-            (bid > 0)
-            & (ask > 0)
-            & (ask >= bid)
-        )
-
-        work["mid"] = np.where(
-            valid_market,
-            (bid + ask) / 2,
-            last_price,
-        )
-
-        work["spread"] = np.where(
-            valid_market,
-            ask - bid,
-            np.nan,
-        )
-
-        work["spread_pct"] = np.where(
-            (
-                work["mid"] > 0
-            )
-            & np.isfinite(
-                work["spread"]
-            ),
-            (
-                work["spread"]
-                / work["mid"]
-            ) * 100,
-            999,
-        )
-
-        work = work[
-            work["mid"] > 0
-        ].copy()
-
-        if work.empty:
-            return None
-
-        # Reject extremely poor markets.
-        work = work[
-            work["spread_pct"] <= 12
-        ].copy()
-
-        if work.empty:
-            return None
-
-        volume = (
-            work["volume"]
-            .fillna(0)
-            .clip(lower=0)
-        )
-
-        oi = (
-            work["openInterest"]
-            .fillna(0)
-            .clip(lower=0)
-        )
-
-        # ----------------------------------------------------
-        # Liquidity score
-        # ----------------------------------------------------
-
-        work["liquidity_score"] = (
-            np.log1p(volume) * 2.0
-            + np.log1p(oi) * 1.0
-        )
-
-        work["distance_penalty"] = (
-            work["distance"] / 50
-        )
-
-        work["spread_penalty"] = (
-            work["spread_pct"]
-            .clip(0, 12)
-            * 2
-        )
-
-        work["selection_score"] = (
-            work["liquidity_score"]
-            - work["distance_penalty"]
-            - work["spread_penalty"]
-        )
-
-        # Prefer reasonable OI/volume.
-        work = work.sort_values(
-            [
-                "selection_score",
-                "openInterest",
-                "volume",
-            ],
-            ascending=False,
-        )
-
-        if work.empty:
-            return None
-
-        return work.iloc[0]
-
-    except Exception as exc:
-        logging.warning(
-            "Option selection failed: %s",
-            exc,
-        )
+    if work.empty:
         return None
+
+    work["distance"] = (
+        work["strike"]
+        - atm
+    ).abs()
+
+    work = work[
+        work["distance"] <= 300
+    ].copy()
+
+    if direction == "CE":
+
+        work = work[
+            (
+                work["strike"]
+                >= atm - 50
+            )
+            &
+            (
+                work["strike"]
+                <= atm + 100
+            )
+        ].copy()
+
+    elif direction == "PE":
+
+        work = work[
+            (
+                work["strike"]
+                >= atm - 100
+            )
+            &
+            (
+                work["strike"]
+                <= atm + 50
+            )
+        ].copy()
+
+    else:
+
+        return None
+
+    if work.empty:
+        return None
+
+    bid = pd.to_numeric(
+        work["bid"],
+        errors="coerce",
+    ).fillna(0)
+
+    ask = pd.to_numeric(
+        work["ask"],
+        errors="coerce",
+    ).fillna(0)
+
+    last_price = pd.to_numeric(
+        work["lastPrice"],
+        errors="coerce",
+    ).fillna(0)
+
+    valid_market = (
+        (bid > 0)
+        &
+        (ask > 0)
+        &
+        (ask >= bid)
+    )
+
+    work["mid"] = np.where(
+        valid_market,
+        (bid + ask) / 2,
+        last_price,
+    )
+
+    work["spread"] = np.where(
+        valid_market,
+        ask - bid,
+        np.nan,
+    )
+
+    work["spread_pct"] = np.where(
+        (
+            work["mid"] > 0
+        )
+        &
+        np.isfinite(
+            work["spread"]
+        ),
+        (
+            work["spread"]
+            / work["mid"]
+        ) * 100,
+        999,
+    )
+
+    work = work[
+        work["mid"] > 0
+    ].copy()
+
+    if work.empty:
+        return None
+
+    # Hard liquidity filter.
+    work = work[
+        work["spread_pct"] <= 12
+    ].copy()
+
+    if work.empty:
+        return None
+
+    volume = pd.to_numeric(
+        work["volume"],
+        errors="coerce",
+    ).fillna(0)
+
+    oi = pd.to_numeric(
+        work["openInterest"],
+        errors="coerce",
+    ).fillna(0)
+
+    work["liquidity_score"] = (
+        np.log1p(volume) * 2
+        + np.log1p(oi)
+    )
+
+    work["distance_penalty"] = (
+        work["distance"]
+        / 50
+    )
+
+    work["spread_penalty"] = (
+        work["spread_pct"]
+        .clip(0, 12)
+        * 2
+    )
+
+    work["selection_score"] = (
+        work["liquidity_score"]
+        - work["distance_penalty"]
+        - work["spread_penalty"]
+    )
+
+    work = work.sort_values(
+        "selection_score",
+        ascending=False,
+    )
+
+    if work.empty:
+        return None
+
+    return work.iloc[0]
 
 
 # ============================================================
@@ -1972,6 +1833,7 @@ def calculate_pcr(
     calls,
     puts,
 ):
+
     if (
         calls is None
         or puts is None
@@ -1983,49 +1845,43 @@ def calculate_pcr(
             np.nan,
         )
 
-    try:
-        call_oi = safe_float(
-            calls["openInterest"].sum(),
-            0,
-        )
+    call_oi = safe_float(
+        calls["openInterest"].sum(),
+        0,
+    )
 
-        put_oi = safe_float(
-            puts["openInterest"].sum(),
-            0,
-        )
+    put_oi = safe_float(
+        puts["openInterest"].sum(),
+        0,
+    )
 
-        call_volume = safe_float(
-            calls["volume"].sum(),
-            0,
-        )
+    call_volume = safe_float(
+        calls["volume"].sum(),
+        0,
+    )
 
-        put_volume = safe_float(
-            puts["volume"].sum(),
-            0,
-        )
+    put_volume = safe_float(
+        puts["volume"].sum(),
+        0,
+    )
 
-        oi_pcr = (
-            put_oi / call_oi
-            if call_oi > 0
-            else np.nan
-        )
+    oi_pcr = (
+        put_oi / call_oi
+        if call_oi > 0
+        else np.nan
+    )
 
-        volume_pcr = (
-            put_volume / call_volume
-            if call_volume > 0
-            else np.nan
-        )
+    volume_pcr = (
+        put_volume
+        / call_volume
+        if call_volume > 0
+        else np.nan
+    )
 
-        return (
-            oi_pcr,
-            volume_pcr,
-        )
-
-    except Exception:
-        return (
-            np.nan,
-            np.nan,
-        )
+    return (
+        oi_pcr,
+        volume_pcr,
+    )
 
 
 # ============================================================
@@ -2036,6 +1892,7 @@ def calculate_max_pain(
     calls,
     puts,
 ):
+
     if (
         calls is None
         or puts is None
@@ -2044,105 +1901,136 @@ def calculate_max_pain(
     ):
         return np.nan
 
-    try:
-        calls = calls.copy()
-        puts = puts.copy()
+    c = calls.copy()
+    p = puts.copy()
 
-        for df in (calls, puts):
-            df["strike"] = pd.to_numeric(
-                df["strike"],
-                errors="coerce",
-            )
+    required = [
+        "strike",
+        "openInterest",
+    ]
 
-            df["openInterest"] = (
-                pd.to_numeric(
-                    df["openInterest"],
-                    errors="coerce",
-                )
-                .fillna(0)
-                .clip(lower=0)
-            )
-
-        calls = calls.dropna(
-            subset=["strike"]
-        )
-
-        puts = puts.dropna(
-            subset=["strike"]
-        )
-
-        if calls.empty or puts.empty:
-            return np.nan
-
-        strikes = sorted(
-            set(
-                calls["strike"].astype(float)
-            ).union(
-                set(
-                    puts["strike"].astype(float)
-                )
-            )
-        )
-
-        if not strikes:
-            return np.nan
-
-        call_strikes = (
-            calls["strike"].to_numpy()
-        )
-
-        call_oi = (
-            calls["openInterest"].to_numpy()
-        )
-
-        put_strikes = (
-            puts["strike"].to_numpy()
-        )
-
-        put_oi = (
-            puts["openInterest"].to_numpy()
-        )
-
-        lowest_loss = np.inf
-        best_strike = np.nan
-
-        for settlement in strikes:
-
-            call_loss = np.sum(
-                np.maximum(
-                    settlement
-                    - call_strikes,
-                    0,
-                )
-                * call_oi
-            )
-
-            put_loss = np.sum(
-                np.maximum(
-                    put_strikes
-                    - settlement,
-                    0,
-                )
-                * put_oi
-            )
-
-            total_loss = (
-                call_loss
-                + put_loss
-            )
-
-            if total_loss < lowest_loss:
-                lowest_loss = total_loss
-                best_strike = settlement
-
-        return best_strike
-
-    except Exception as exc:
-        logging.warning(
-            "Max pain failed: %s",
-            exc,
-        )
+    if any(
+        col not in c.columns
+        for col in required
+    ):
         return np.nan
+
+    if any(
+        col not in p.columns
+        for col in required
+    ):
+        return np.nan
+
+    c = c[
+        c["strike"].notna()
+    ].copy()
+
+    p = p[
+        p["strike"].notna()
+    ].copy()
+
+    if c.empty or p.empty:
+        return np.nan
+
+    c["openInterest"] = (
+        pd.to_numeric(
+            c["openInterest"],
+            errors="coerce",
+        )
+        .fillna(0)
+        .clip(lower=0)
+    )
+
+    p["openInterest"] = (
+        pd.to_numeric(
+            p["openInterest"],
+            errors="coerce",
+        )
+        .fillna(0)
+        .clip(lower=0)
+    )
+
+    c = (
+        c.groupby(
+            "strike",
+            as_index=False,
+        )["openInterest"]
+        .sum()
+    )
+
+    p = (
+        p.groupby(
+            "strike",
+            as_index=False,
+        )["openInterest"]
+        .sum()
+    )
+
+    call_strikes = c[
+        "strike"
+    ].to_numpy(dtype=float)
+
+    call_oi = c[
+        "openInterest"
+    ].to_numpy(dtype=float)
+
+    put_strikes = p[
+        "strike"
+    ].to_numpy(dtype=float)
+
+    put_oi = p[
+        "openInterest"
+    ].to_numpy(dtype=float)
+
+    strikes = sorted(
+        set(call_strikes)
+        .union(
+            set(put_strikes)
+        )
+    )
+
+    if not strikes:
+        return np.nan
+
+    best_strike = np.nan
+    lowest_loss = np.inf
+
+    for settlement in strikes:
+
+        call_loss = np.sum(
+            np.maximum(
+                settlement
+                - call_strikes,
+                0,
+            )
+            * call_oi
+        )
+
+        put_loss = np.sum(
+            np.maximum(
+                put_strikes
+                - settlement,
+                0,
+            )
+            * put_oi
+        )
+
+        total_loss = (
+            call_loss
+            + put_loss
+        )
+
+        if total_loss < lowest_loss:
+
+            lowest_loss = (
+                total_loss
+            )
+
+            best_strike = (
+                settlement
+            )
+
+    return best_strike
 
 
 # ============================================================
@@ -2154,6 +2042,7 @@ def get_oi_levels(
     puts,
     price,
 ):
+
     if (
         calls is None
         or puts is None
@@ -2165,85 +2054,103 @@ def get_oi_levels(
             np.nan,
         )
 
-    price = safe_float(price)
+    price = safe_float(
+        price
+    )
 
-    if not positive(price):
+    if not finite(price):
         return (
             np.nan,
             np.nan,
         )
 
-    try:
-        calls_near = calls[
-            (calls["strike"] >= price)
-            & (calls["strike"] <= price + 500)
-            & (calls["openInterest"] > 0)
-        ].copy()
+    calls_near = calls[
+        (
+            calls["strike"]
+            >= price
+        )
+        &
+        (
+            calls["strike"]
+            <= price + 500
+        )
+    ].copy()
 
-        puts_near = puts[
-            (puts["strike"] <= price)
-            & (puts["strike"] >= price - 500)
-            & (puts["openInterest"] > 0)
-        ].copy()
+    puts_near = puts[
+        (
+            puts["strike"]
+            <= price
+        )
+        &
+        (
+            puts["strike"]
+            >= price - 500
+        )
+    ].copy()
 
-        resistance = np.nan
-        support = np.nan
+    resistance = np.nan
+    support = np.nan
 
-        if not calls_near.empty:
-            distance = (
-                calls_near["strike"]
-                - price
-            ).clip(lower=0)
+    if not calls_near.empty:
 
-            calls_near["level_score"] = (
-                calls_near["openInterest"]
-                / (1 + distance / 50)
+        calls_near["level_score"] = (
+            calls_near[
+                "openInterest"
+            ]
+            /
+            (
+                1
+                +
+                (
+                    calls_near[
+                        "strike"
+                    ]
+                    - price
+                ) / 50
             )
-
-            resistance = safe_float(
-                calls_near
-                .sort_values(
-                    "level_score",
-                    ascending=False,
-                )
-                .iloc[0]["strike"]
-            )
-
-        if not puts_near.empty:
-            distance = (
-                price
-                - puts_near["strike"]
-            ).clip(lower=0)
-
-            puts_near["level_score"] = (
-                puts_near["openInterest"]
-                / (1 + distance / 50)
-            )
-
-            support = safe_float(
-                puts_near
-                .sort_values(
-                    "level_score",
-                    ascending=False,
-                )
-                .iloc[0]["strike"]
-            )
-
-        return (
-            resistance,
-            support,
         )
 
-    except Exception as exc:
-        logging.warning(
-            "OI levels failed: %s",
-            exc,
+        resistance = safe_float(
+            calls_near.loc[
+                calls_near[
+                    "level_score"
+                ].idxmax(),
+                "strike",
+            ]
         )
 
-        return (
-            np.nan,
-            np.nan,
+    if not puts_near.empty:
+
+        puts_near["level_score"] = (
+            puts_near[
+                "openInterest"
+            ]
+            /
+            (
+                1
+                +
+                (
+                    price
+                    - puts_near[
+                        "strike"
+                    ]
+                ) / 50
+            )
         )
+
+        support = safe_float(
+            puts_near.loc[
+                puts_near[
+                    "level_score"
+                ].idxmax(),
+                "strike",
+            ]
+        )
+
+    return (
+        resistance,
+        support,
+    )
 
 
 # ============================================================
@@ -2251,12 +2158,20 @@ def get_oi_levels(
 # ============================================================
 
 def build_trade_plan(
-    action,
+    signal,
     option_row,
     nifty_price,
     atr,
 ):
-    if option_row is None:
+
+    if (
+        option_row is None
+        or signal
+        not in {
+            "BUY CE",
+            "BUY PE",
+        }
+    ):
         return None
 
     nifty_price = safe_float(
@@ -2268,117 +2183,108 @@ def build_trade_plan(
     )
 
     if (
-        not positive(nifty_price)
-        or not positive(atr)
+        not finite(nifty_price)
+        or not finite(atr)
+        or atr <= 0
     ):
         return None
 
-    if action not in {
-        "BUY CE",
-        "BUY PE",
-    }:
+    bid = safe_float(
+        option_row.get("bid")
+    )
+
+    ask = safe_float(
+        option_row.get("ask")
+    )
+
+    last_price = safe_float(
+        option_row.get("lastPrice")
+    )
+
+    if (
+        finite(bid)
+        and finite(ask)
+        and bid > 0
+        and ask > 0
+        and ask >= bid
+    ):
+
+        entry = (
+            bid + ask
+        ) / 2
+
+    elif (
+        finite(last_price)
+        and last_price > 0
+    ):
+
+        entry = last_price
+
+    else:
+
         return None
 
-    try:
-        bid = safe_float(
-            option_row.get("bid")
-        )
-
-        ask = safe_float(
-            option_row.get("ask")
-        )
-
-        last_price = safe_float(
-            option_row.get("lastPrice")
-        )
-
-        # ----------------------------------------------------
-        # Entry
-        # ----------------------------------------------------
-
-        if (
-            positive(bid)
-            and positive(ask)
-            and ask >= bid
-        ):
-            entry = (
-                bid + ask
-            ) / 2
-
-        elif positive(last_price):
-            entry = last_price
-
-        else:
-            return None
-
-        if not positive(entry):
-            return None
-
-        # ----------------------------------------------------
-        # Premium risk
-        #
-        # 18% SL
-        # R:R:
-        # T1 = 1.5R
-        # T2 = 2.5R
-        # T3 = 4R
-        # ----------------------------------------------------
-
-        stop_loss = entry * 0.82
-
-        risk = (
-            entry
-            - stop_loss
-        )
-
-        if risk <= 0:
-            return None
-
-        target1 = (
-            entry
-            + risk * 1.5
-        )
-
-        target2 = (
-            entry
-            + risk * 2.5
-        )
-
-        target3 = (
-            entry
-            + risk * 4.0
-        )
-
-        # ----------------------------------------------------
-        # Underlying invalidation
-        # ----------------------------------------------------
-
-        if action == "BUY CE":
-            nifty_stop = (
-                nifty_price
-                - 0.80 * atr
-            )
-        else:
-            nifty_stop = (
-                nifty_price
-                + 0.80 * atr
-            )
-
-        return {
-            "entry": entry,
-            "stop_loss": stop_loss,
-            "target1": target1,
-            "target2": target2,
-            "target3": target3,
-            "nifty_stop": nifty_stop,
-        }
-
-    except Exception as exc:
-        logging.warning(
-            "Trade plan failed: %s",
-            exc,
-        )
+    if entry <= 0:
         return None
+
+    # Conservative option premium SL.
+    stop_loss = (
+        entry * 0.82
+    )
+
+    risk = (
+        entry
+        - stop_loss
+    )
+
+    target1 = (
+        entry
+        + risk * 1.5
+    )
+
+    target2 = (
+        entry
+        + risk * 2.5
+    )
+
+    target3 = (
+        entry
+        + risk * 4.0
+    )
+
+    if signal == "BUY CE":
+
+        nifty_stop = (
+            nifty_price
+            - 0.80 * atr
+        )
+
+    else:
+
+        nifty_stop = (
+            nifty_price
+            + 0.80 * atr
+        )
+
+    return {
+
+        "entry": entry,
+
+        "stop_loss":
+            stop_loss,
+
+        "target1":
+            target1,
+
+        "target2":
+            target2,
+
+        "target3":
+            target3,
+
+        "nifty_stop":
+            nifty_stop,
+    }
 
 
 # ============================================================
@@ -2390,6 +2296,7 @@ def build_trade_plan(
     show_spinner=False,
 )
 def get_fundamentals(symbol):
+
     empty = {
         "market_cap": np.nan,
         "roe": np.nan,
@@ -2400,58 +2307,84 @@ def get_fundamentals(symbol):
     }
 
     try:
-        ticker = yf.Ticker(
+
+        info = yf.Ticker(
             symbol
-        )
+        ).info
 
-        info = ticker.info or {}
+        if not isinstance(
+            info,
+            dict,
+        ):
+            return empty
 
-        market_cap = safe_float(
-            info.get("marketCap")
-        )
+        result = {
+            "market_cap":
+                safe_float(
+                    info.get(
+                        "marketCap"
+                    )
+                ),
 
-        roe = safe_float(
-            info.get("returnOnEquity")
-        )
+            "roe":
+                safe_float(
+                    info.get(
+                        "returnOnEquity"
+                    )
+                ),
 
-        debt_equity = safe_float(
-            info.get("debtToEquity")
-        )
+            "debt_equity":
+                safe_float(
+                    info.get(
+                        "debtToEquity"
+                    )
+                ),
 
-        profit_margin = safe_float(
-            info.get("profitMargins")
-        )
+            "profit_margin":
+                safe_float(
+                    info.get(
+                        "profitMargins"
+                    )
+                ),
 
-        revenue_growth = safe_float(
-            info.get("revenueGrowth")
-        )
+            "revenue_growth":
+                safe_float(
+                    info.get(
+                        "revenueGrowth"
+                    )
+                ),
 
-        earnings_growth = safe_float(
-            info.get("earningsGrowth")
-        )
-
-        if finite(roe):
-            roe *= 100
-
-        if finite(profit_margin):
-            profit_margin *= 100
-
-        if finite(revenue_growth):
-            revenue_growth *= 100
-
-        if finite(earnings_growth):
-            earnings_growth *= 100
-
-        return {
-            "market_cap": market_cap,
-            "roe": roe,
-            "debt_equity": debt_equity,
-            "profit_margin": profit_margin,
-            "revenue_growth": revenue_growth,
-            "earnings_growth": earnings_growth,
+            "earnings_growth":
+                safe_float(
+                    info.get(
+                        "earningsGrowth"
+                    )
+                ),
         }
 
+        # Yahoo usually returns these as decimals.
+        for key in [
+            "roe",
+            "profit_margin",
+            "revenue_growth",
+            "earnings_growth",
+        ]:
+
+            value = result[key]
+
+            if finite(value):
+
+                # If already supplied as a percentage,
+                # do not multiply again.
+                if abs(value) <= 1.5:
+                    result[key] = (
+                        value * 100
+                    )
+
+        return result
+
     except Exception as exc:
+
         logging.warning(
             "Fundamental data failed for %s: %s",
             symbol,
@@ -2461,11 +2394,10 @@ def get_fundamentals(symbol):
         return empty
 
 
-# ============================================================
-# CAP LABEL
-# ============================================================
+def get_cap_label(
+    market_cap
+):
 
-def get_cap_label(market_cap):
     market_cap = safe_float(
         market_cap
     )
@@ -2473,7 +2405,6 @@ def get_cap_label(market_cap):
     if not finite(market_cap):
         return "-"
 
-    # Yahoo marketCap for Indian stocks is normally INR.
     if market_cap >= 2e12:
         return "Large Cap"
 
@@ -2484,34 +2415,15 @@ def get_cap_label(market_cap):
 
 
 # ============================================================
-# CACHE CLEAR
-# ============================================================
-
-def clear_market_cache():
-    functions = [
-        download_intraday_batch,
-        download_daily_batch,
-        get_nifty_intraday,
-        get_nifty_daily,
-        get_nifty_options,
-        get_fundamentals,
-    ]
-
-    for func in functions:
-        try:
-            func.clear()
-        except Exception:
-            pass
-
-
-# ============================================================
 # NIFTY RENDER
 # ============================================================
 
 def render_nifty():
+
     with st.spinner(
         "NIFTY data load ho raha hai..."
     ):
+
         nifty_intraday = (
             get_nifty_intraday()
         )
@@ -2524,6 +2436,7 @@ def render_nifty():
         nifty_intraday.empty
         or nifty_daily.empty
     ):
+
         st.error(
             "❌ NIFTY data available nahi hai."
         )
@@ -2543,10 +2456,12 @@ def render_nifty():
     )
 
     if market is None:
+
         st.warning(
             "⚠️ Valid completed candles / "
             "technical data sufficient nahi hai."
         )
+
         return
 
     price = market["price"]
@@ -2581,9 +2496,11 @@ def render_nifty():
         )
     )
 
-    max_pain = calculate_max_pain(
-        calls,
-        puts,
+    max_pain = (
+        calculate_max_pain(
+            calls,
+            puts,
+        )
     )
 
     resistance, support = (
@@ -2594,13 +2511,17 @@ def render_nifty():
         )
     )
 
-    signal = market["signal"]
-
     # ========================================================
     # TOP METRICS
     # ========================================================
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    st.subheader(
+        "📊 NIFTY Snapshot"
+    )
+
+    m1, m2, m3, m4, m5 = (
+        st.columns(5)
+    )
 
     m1.metric(
         "NIFTY",
@@ -2609,7 +2530,7 @@ def render_nifty():
 
     m2.metric(
         "ATM",
-        str(atm) if finite(atm) else "-",
+        str(atm),
     )
 
     m3.metric(
@@ -2624,75 +2545,73 @@ def render_nifty():
 
     m5.metric(
         "Signal",
-        signal,
+        market["signal"],
     )
 
-    candle_time = market.get(
-        "candle_time"
+    st.caption(
+        f"{market_status()} • "
+        f"Signal last completed 5-minute candle "
+        f"par based hai: "
+        f"{market['candle_time']}"
     )
-
-    if candle_time is not None:
-        st.caption(
-            "Signal last completed 5-minute candle "
-            f"({candle_time.strftime('%d-%m-%Y %H:%M IST')}) "
-            "par based hai."
-        )
 
     # ========================================================
-    # ACTION
+    # FINAL SIGNAL
     # ========================================================
 
     st.subheader(
         "🚨 FINAL SIGNAL"
     )
 
+    signal = market["signal"]
+
     if signal == "STRONG BUY":
 
         st.success(
             "🟢 STRONG BUY CE — "
-            "Bullish confirmation strong hai."
+            "Bullish confirmation strong"
         )
 
     elif signal == "STRONG SELL":
 
         st.error(
-            "🔴 STRONG SELL — "
-            "Bearish confirmation strong hai."
+            "🔴 STRONG BUY PE — "
+            "Bearish confirmation strong"
         )
 
     elif signal == "BUY WATCH":
 
         st.info(
             "🟢 BUY WATCH — "
-            "Bullish setup hai; final confirmation wait karein."
+            "Confirmation ka wait karein."
         )
 
     elif signal == "SELL WATCH":
 
         st.info(
             "🔴 SELL WATCH — "
-            "Bearish setup hai; final confirmation wait karein."
+            "Confirmation ka wait karein."
         )
 
     elif signal == "WATCH BUY":
 
         st.info(
             "🟢 WATCH BUY — "
-            "Bullish bias hai, lekin confirmation incomplete hai."
+            "Setup developing hai."
         )
 
     elif signal == "WATCH SELL":
 
         st.info(
             "🔴 WATCH SELL — "
-            "Bearish bias hai, lekin confirmation incomplete hai."
+            "Setup developing hai."
         )
 
     else:
 
         st.warning(
             "🟡 WAIT — "
-            "Strong directional edge nahi mili."
+            "Strong confirmation nahi mili."
         )
 
     if signal == "STRONG BUY":
@@ -2712,40 +2631,59 @@ def render_nifty():
         "📐 Technical Dashboard"
     )
 
-    a1, a2, a3, a4, a5, a6 = st.columns(6)
+    a = st.columns(7)
 
-    a1.metric(
+    a[0].metric(
         "EMA20",
-        fmt(market["ema20"]),
+        fmt(
+            market["ema20"]
+        ),
     )
 
-    a2.metric(
+    a[1].metric(
         "EMA50",
-        fmt(market["ema50"]),
+        fmt(
+            market["ema50"]
+        ),
     )
 
-    a3.metric(
+    a[2].metric(
         "Intraday EMA200",
         fmt(
-            market["ema200_intraday"]
+            market[
+                "ema200_intraday"
+            ]
         ),
     )
 
-    a4.metric(
+    a[3].metric(
         "Daily EMA200",
         fmt(
-            market["daily_ema200"]
+            market[
+                "daily_ema200"
+            ]
         ),
     )
 
-    a5.metric(
+    a[4].metric(
         "VWAP",
-        fmt(market["vwap"]),
+        fmt(
+            market["vwap"]
+        ),
     )
 
-    a6.metric(
+    a[5].metric(
         "RSI",
-        fmt(market["rsi"]),
+        fmt(
+            market["rsi"]
+        ),
+    )
+
+    a[6].metric(
+        "ATR",
+        fmt(
+            market["atr"]
+        ),
     )
 
     # ========================================================
@@ -2756,27 +2694,35 @@ def render_nifty():
         "⚡ Momentum / Volume"
     )
 
-    q1, q2, q3 = st.columns(3)
+    q1, q2, q3 = (
+        st.columns(3)
+    )
 
     q1.metric(
         "ROC5",
-        pct(market["roc5"]),
+        pct(
+            market["roc5"]
+        ),
     )
 
     q2.metric(
         "ROC10",
-        pct(market["roc10"]),
+        pct(
+            market["roc10"]
+        ),
     )
 
-    volume_ratio = safe_float(
-        market["volume_ratio"]
-    )
+    volume_ratio = market[
+        "volume_ratio"
+    ]
 
     q3.metric(
         "Volume Ratio",
         (
             f"{volume_ratio:.2f}x"
-            if finite(volume_ratio)
+            if finite(
+                volume_ratio
+            )
             else "-"
         ),
     )
@@ -2793,56 +2739,56 @@ def render_nifty():
         calls.empty
         or puts.empty
     ):
+
         st.warning(
-            "⚠️ Yahoo Finance se option chain "
-            "available nahi hui."
+            "⚠️ Yahoo Finance se "
+            "NIFTY option chain available nahi hui."
         )
 
     else:
 
-        o1, o2, o3 = st.columns(3)
+        o = st.columns(6)
 
-        o1.metric(
+        o[0].metric(
             "Expiry",
             str(expiry),
         )
 
-        o2.metric(
+        o[1].metric(
             "OI PCR",
             fmt(oi_pcr),
         )
 
-        o3.metric(
+        o[2].metric(
             "Volume PCR",
             fmt(volume_pcr),
         )
 
-        o4, o5, o6 = st.columns(3)
-
-        o4.metric(
+        o[3].metric(
             "Max Pain",
-            fmt(max_pain, 0),
+            fmt(
+                max_pain,
+                0,
+            ),
         )
 
-        o5.metric(
+        o[4].metric(
             "OI Resistance",
-            fmt(resistance, 0),
+            fmt(
+                resistance,
+                0,
+            ),
         )
 
-        o6.metric(
+        o[5].metric(
             "OI Support",
-            fmt(support, 0),
+            fmt(
+                support,
+                0,
+            ),
         )
 
-        # ----------------------------------------------------
-        # Selected options
-        # ----------------------------------------------------
-
-        st.subheader(
-            "⚔️ Selected CE / PE"
-        )
-
-        option_rows = []
+        rows = []
 
         for side, row in (
             ("CE", ce_row),
@@ -2858,45 +2804,69 @@ def render_nifty():
                 )
             )
 
-            option_rows.append(
+            rows.append(
                 {
                     "Side": side,
-                    "Strike": safe_float(
-                        row.get("strike")
-                    ),
-                    "Last": safe_float(
-                        row.get("lastPrice")
-                    ),
-                    "Bid": safe_float(
-                        row.get("bid")
-                    ),
-                    "Ask": safe_float(
-                        row.get("ask")
-                    ),
-                    "Volume": safe_float(
-                        row.get("volume"),
-                        0,
-                    ),
-                    "OI": safe_float(
-                        row.get("openInterest"),
-                        0,
-                    ),
-                    "IV %": (
-                        iv * 100
-                        if finite(iv)
-                        else np.nan
-                    ),
+
+                    "Strike":
+                        safe_float(
+                            row.get(
+                                "strike"
+                            )
+                        ),
+
+                    "Last":
+                        safe_float(
+                            row.get(
+                                "lastPrice"
+                            )
+                        ),
+
+                    "Bid":
+                        safe_float(
+                            row.get(
+                                "bid"
+                            )
+                        ),
+
+                    "Ask":
+                        safe_float(
+                            row.get(
+                                "ask"
+                            )
+                        ),
+
+                    "Volume":
+                        safe_float(
+                            row.get(
+                                "volume"
+                            ),
+                            0,
+                        ),
+
+                    "OI":
+                        safe_float(
+                            row.get(
+                                "openInterest"
+                            ),
+                            0,
+                        ),
+
+                    "IV %":
+                        (
+                            iv * 100
+                            if finite(iv)
+                            else np.nan
+                        ),
                 }
             )
 
-        if option_rows:
-
-            option_df = pd.DataFrame(
-                option_rows
-            )
+        if rows:
 
             st.dataframe(
-                option_df.round(2),
+                pd.DataFrame(
+                    rows
+                ).round(2),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -2916,13 +2886,14 @@ def render_nifty():
         "🎯 Trade Plan"
     )
 
-    selected_option = None
-
     if action == "BUY CE":
         selected_option = ce_row
 
     elif action == "BUY PE":
         selected_option = pe_row
+
+    else:
+        selected_option = None
 
     plan = build_trade_plan(
         action,
@@ -2934,39 +2905,50 @@ def render_nifty():
     if plan is None:
 
         st.info(
-            "Trade plan unavailable — "
-            "strong signal + valid option liquidity "
-            "required."
+            "Trade plan unavailable. "
+            "Strong signal + liquid option "
+            "confirmation required."
         )
 
     else:
 
-        p1, p2, p3, p4 = st.columns(4)
+        p1, p2, p3, p4 = (
+            st.columns(4)
+        )
 
         p1.metric(
             "Entry",
-            fmt(plan["entry"]),
+            fmt(
+                plan["entry"]
+            ),
         )
 
         p2.metric(
             "SL",
-            fmt(plan["stop_loss"]),
+            fmt(
+                plan["stop_loss"]
+            ),
         )
 
         p3.metric(
             "T1",
-            fmt(plan["target1"]),
+            fmt(
+                plan["target1"]
+            ),
         )
 
         p4.metric(
             "T2",
-            fmt(plan["target2"]),
+            fmt(
+                plan["target2"]
+            ),
         )
 
         st.caption(
-            f'T3: {fmt(plan["target3"])} | '
-            f'Underlying NIFTY invalidation: '
-            f'{fmt(plan["nifty_stop"])}'
+            f"T3: "
+            f"{fmt(plan['target3'])} | "
+            f"Underlying NIFTY risk level: "
+            f"{fmt(plan['nifty_stop'])}"
         )
 
     # ========================================================
@@ -2977,7 +2959,9 @@ def render_nifty():
         "✅ Confirmation Checklist"
     )
 
-    left, right = st.columns(2)
+    left, right = (
+        st.columns(2)
+    )
 
     with left:
 
@@ -3025,11 +3009,6 @@ def render_nifty():
         "📈 NIFTY 5-Minute Chart"
     )
 
-    chart_source = market.get(
-        "chart_df",
-        pd.DataFrame(),
-    )
-
     chart_columns = [
         "Close",
         "EMA20",
@@ -3037,36 +3016,39 @@ def render_nifty():
         "VWAP",
     ]
 
+    chart_df = (
+        market["chart_df"]
+        .copy()
+    )
+
     available_columns = [
         col
         for col in chart_columns
-        if col in chart_source.columns
+        if col in chart_df.columns
     ]
 
     if available_columns:
 
         chart_df = (
-            chart_source[
+            chart_df[
                 available_columns
             ]
             .tail(150)
-            .copy()
+            .dropna(
+                how="all"
+            )
         )
 
-        st.line_chart(
-            chart_df,
-            height=450,
-        )
+        if not chart_df.empty:
 
-    else:
-
-        st.info(
-            "Chart ke liye sufficient indicator data nahi hai."
-        )
+            st.line_chart(
+                chart_df,
+                height=450,
+            )
 
 
 # ============================================================
-# PAGE TABS
+# TABS
 # ============================================================
 
 tab_nifty, tab_stocks = st.tabs(
@@ -3091,14 +3073,15 @@ with tab_nifty:
         market_status()
     )
 
-    c1, c2 = st.columns(2)
+    c1, c2 = (
+        st.columns(2)
+    )
 
     with c1:
 
         refresh_nifty = st.button(
             "🔄 Refresh NIFTY",
             use_container_width=True,
-            key="refresh_nifty_button",
         )
 
     with c2:
@@ -3106,12 +3089,34 @@ with tab_nifty:
         auto_refresh = st.checkbox(
             "⏱️ Auto Refresh (45s)",
             value=False,
-            key="auto_refresh_checkbox",
         )
 
     if refresh_nifty:
 
-        clear_market_cache()
+        try:
+            download_intraday_batch.clear()
+        except Exception:
+            pass
+
+        try:
+            download_daily_batch.clear()
+        except Exception:
+            pass
+
+        try:
+            get_nifty_intraday.clear()
+        except Exception:
+            pass
+
+        try:
+            get_nifty_daily.clear()
+        except Exception:
+            pass
+
+        try:
+            get_nifty_options.clear()
+        except Exception:
+            pass
 
         st.session_state.nifty_last_refresh = (
             datetime.now(IST)
@@ -3119,10 +3124,7 @@ with tab_nifty:
 
         st.rerun()
 
-    # --------------------------------------------------------
-    # Auto refresh
-    # --------------------------------------------------------
-
+    # Streamlit fragment is supported in newer versions.
     if (
         auto_refresh
         and hasattr(st, "fragment")
@@ -3137,17 +3139,15 @@ with tab_nifty:
 
         live_nifty()
 
-    elif auto_refresh:
-
-        st.info(
-            "Current Streamlit version native "
-            "fragment auto-refresh support nahi karta. "
-            "Manual refresh use karein."
-        )
-
-        render_nifty()
-
     else:
+
+        if auto_refresh:
+
+            st.info(
+                "Auto-refresh ke liye recent "
+                "Streamlit version use karein. "
+                "Abhi manual refresh available hai."
+            )
 
         render_nifty()
 
@@ -3168,7 +3168,9 @@ with tab_stocks:
         "volume + breakout"
     )
 
-    s1, s2, s3 = st.columns(3)
+    s1, s2, s3 = (
+        st.columns(3)
+    )
 
     with s1:
 
@@ -3176,7 +3178,6 @@ with tab_stocks:
             "Stocks to scan",
             [25, 50],
             index=1,
-            key="scan_count_select",
         )
 
     with s2:
@@ -3186,7 +3187,6 @@ with tab_stocks:
             40,
             90,
             62,
-            key="min_buy_score_slider",
         )
 
     with s3:
@@ -3194,7 +3194,6 @@ with tab_stocks:
         run_scan = st.button(
             "🚀 SCAN STOCKS",
             use_container_width=True,
-            key="scan_stocks_button",
         )
 
     symbols = DEFAULT_STOCKS[
@@ -3203,10 +3202,6 @@ with tab_stocks:
             len(DEFAULT_STOCKS),
         )
     ]
-
-    # ========================================================
-    # RUN SCAN
-    # ========================================================
 
     if run_scan:
 
@@ -3257,17 +3252,21 @@ with tab_stocks:
 
             for symbol in symbols:
 
-                future = executor.submit(
-                    worker,
-                    symbol,
-                )
+                futures[
+                    executor.submit(
+                        worker,
+                        symbol,
+                    )
+                ] = symbol
 
-                futures[future] = symbol
-
-            total = len(futures)
+            total = len(
+                futures
+            )
 
             for done, future in enumerate(
-                as_completed(futures),
+                as_completed(
+                    futures
+                ),
                 start=1,
             ):
 
@@ -3277,9 +3276,12 @@ with tab_stocks:
 
                 try:
 
-                    result = future.result()
+                    result = (
+                        future.result()
+                    )
 
                     if result is not None:
+
                         results.append(
                             result
                         )
@@ -3287,16 +3289,17 @@ with tab_stocks:
                 except Exception as exc:
 
                     logging.warning(
-                        "Stock future failed for %s: %s",
+                        "Stock analysis failed "
+                        "for %s: %s",
                         symbol,
                         exc,
                     )
 
-                progress.progress(
-                    done / total
-                    if total
-                    else 1.0
-                )
+                if total:
+
+                    progress.progress(
+                        done / total
+                    )
 
                 status.write(
                     f"Analysing "
@@ -3305,10 +3308,6 @@ with tab_stocks:
 
         progress.empty()
         status.empty()
-
-        # ====================================================
-        # STORE RESULTS
-        # ====================================================
 
         if not results:
 
@@ -3369,22 +3368,22 @@ with tab_stocks:
 
     else:
 
-        last_scan = (
+        if (
             st.session_state.last_stock_scan
-        )
-
-        if last_scan:
+        ):
 
             st.caption(
                 "Last scan: "
-                + last_scan.strftime(
+                + st.session_state
+                .last_stock_scan
+                .strftime(
                     "%d-%m-%Y %H:%M:%S IST"
                 )
             )
 
-        # ====================================================
+        # ----------------------------------------------------
         # TOP SETUPS
-        # ====================================================
+        # ----------------------------------------------------
 
         st.subheader(
             "🏆 Top Current Setups"
@@ -3392,11 +3391,16 @@ with tab_stocks:
 
         top = result_df[
             (
-                result_df["bull_score"]
+                result_df[
+                    "bull_score"
+                ]
                 >= min_buy_score
             )
-            & (
-                result_df["score"]
+            &
+            (
+                result_df[
+                    "score"
+                ]
                 >= 12
             )
         ].head(10)
@@ -3425,7 +3429,7 @@ with tab_stocks:
                 "volume_ratio",
             ]
 
-            display_columns = [
+            available = [
                 col
                 for col in display_columns
                 if col in top.columns
@@ -3433,15 +3437,15 @@ with tab_stocks:
 
             st.dataframe(
                 top[
-                    display_columns
+                    available
                 ].round(2),
                 use_container_width=True,
                 hide_index=True,
             )
 
-        # ====================================================
+        # ----------------------------------------------------
         # TOP 5 DETAILS
-        # ====================================================
+        # ----------------------------------------------------
 
         st.subheader(
             "🔎 Top 5 Detailed Analysis"
@@ -3456,7 +3460,8 @@ with tab_stocks:
                 f"#{rank} "
                 f"{row['symbol']} — "
                 f"{row['signal']} — "
-                f"Bull {row['bull_score']:.0f}%"
+                f"Bull "
+                f"{row['bull_score']:.0f}%"
             ):
 
                 d1, d2, d3, d4, d5 = (
@@ -3465,7 +3470,9 @@ with tab_stocks:
 
                 d1.metric(
                     "Price",
-                    fmt(row["price"]),
+                    fmt(
+                        row["price"]
+                    ),
                 )
 
                 d2.metric(
@@ -3485,12 +3492,10 @@ with tab_stocks:
 
                 d5.metric(
                     "RSI",
-                    fmt(row["rsi"]),
+                    fmt(
+                        row["rsi"]
+                    ),
                 )
-
-                # ------------------------------------------------
-                # Bullish
-                # ------------------------------------------------
 
                 st.write(
                     "### 🟢 Bullish Confirmation"
@@ -3501,39 +3506,32 @@ with tab_stocks:
                     [],
                 )
 
-                if isinstance(
-                    reasons,
-                    (list, tuple),
-                ) and reasons:
+                if reasons:
 
                     for reason in reasons:
 
                         st.success(
-                            "✓ " + str(reason)
+                            "✓ "
+                            + str(reason)
                         )
 
                 else:
 
                     st.info(
-                        "Strong bullish confirmation nahi."
+                        "Strong bullish "
+                        "confirmation nahi."
                     )
-
-                # ------------------------------------------------
-                # Bearish
-                # ------------------------------------------------
 
                 warnings = row.get(
                     "warnings",
                     [],
                 )
 
-                if isinstance(
-                    warnings,
-                    (list, tuple),
-                ) and warnings:
+                if warnings:
 
                     st.write(
-                        "### ⚠️ Bearish / Risk Factors"
+                        "### ⚠️ Bearish / "
+                        "Risk Factors"
                     )
 
                     for warning in warnings:
@@ -3542,9 +3540,9 @@ with tab_stocks:
                             str(warning)
                         )
 
-                # =================================================
+                # ------------------------------------------------
                 # FUNDAMENTALS
-                # =================================================
+                # ------------------------------------------------
 
                 st.write(
                     "### 🏢 Fundamental Snapshot"
@@ -3575,8 +3573,12 @@ with tab_stocks:
                 f1.metric(
                     "Market Cap",
                     (
-                        f"₹{market_cap / 1e7:,.0f} Cr"
-                        if finite(market_cap)
+                        f"₹"
+                        f"{market_cap / 1e7:,.0f}"
+                        f" Cr"
+                        if finite(
+                            market_cap
+                        )
                         else "-"
                     ),
                 )
@@ -3584,7 +3586,9 @@ with tab_stocks:
                 f2.metric(
                     "ROE",
                     pct(
-                        fundamentals["roe"]
+                        fundamentals[
+                            "roe"
+                        ]
                     ),
                 )
 
@@ -3633,9 +3637,9 @@ with tab_stocks:
                     ),
                 )
 
-        # ====================================================
+        # ----------------------------------------------------
         # COMPLETE RESULTS
-        # ====================================================
+        # ----------------------------------------------------
 
         st.subheader(
             "📋 Complete Scan Results"
@@ -3655,7 +3659,7 @@ with tab_stocks:
             "volume_ratio",
         ]
 
-        complete_columns = [
+        available = [
             col
             for col in complete_columns
             if col in result_df.columns
@@ -3663,37 +3667,40 @@ with tab_stocks:
 
         st.dataframe(
             result_df[
-                complete_columns
+                available
             ].round(2),
             use_container_width=True,
             hide_index=True,
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # BULLISH CHART
-        # ====================================================
+        # ----------------------------------------------------
 
         st.subheader(
             "📊 Strongest Bullish Setups"
         )
 
-        chart_df = (
+        chart_data = (
             result_df
             .sort_values(
                 "bull_score",
                 ascending=False,
             )
             .head(10)
-            .set_index("symbol")[
-                ["bull_score"]
+            .set_index(
+                "symbol"
+            )[
+                [
+                    "bull_score"
+                ]
             ]
         )
 
-        if not chart_df.empty:
+        if not chart_data.empty:
 
             st.bar_chart(
-                chart_df,
-                height=400,
+                chart_data
             )
 
 
@@ -3711,26 +3718,30 @@ Ye app probability/confirmation based analysis hai.
 Guaranteed profit nahi hai.
 
 V4 improvements:
-• Completed 5-minute candle handling improved.
-• Yahoo MultiIndex OHLCV parsing hardened.
-• Invalid OHLC rows filtered.
-• Session VWAP calculation protected.
-• Intraday EMA200 aur Daily EMA200 separate.
-• Bullish/bearish scores independently calculated.
-• Bull-vs-bear edge ranking mein included.
-• Strong signal par hi CE/PE action activate hota hai.
-• STRONG SELL UI ko correctly BUY PE action se map kiya gaya.
-• Option selection spread + liquidity + OI + distance based hai.
-• Extremely wide option spreads rejected.
-• Max Pain calculation protected.
-• OI support/resistance nearby liquid strikes se calculate hota hai.
-• Yahoo download failures graceful handling ke saath hain.
+
+• Forming 5-minute candle ko market state ke according handle kiya gaya hai.
+• Yahoo Finance MultiIndex data handling safer hai.
+• Duplicate OHLCV columns handle kiye gaye hain.
+• Invalid OHLC rows remove kiye jaate hain.
+• Intraday EMA200 aur Daily EMA200 separate hain.
+• Bullish aur bearish scores independently calculate hote hain.
+• Opposite-side confirmation strong hone par STRONG signal downgrade hota hai.
+• Session VWAP use hota hai.
+• Volume current candle ke against previous 20 candles se compare hota hai.
+• Breakout previous candles ke against calculate hota hai.
+• NIFTY option selection spread + liquidity + OI + distance based hai.
+• Wide-spread options reject kiye jaate hain.
+• Max Pain duplicate strikes ko aggregate karke calculate hota hai.
+• OI support/resistance nearby strikes par calculate hota hai.
+• Option chain failure graceful handling ke saath hai.
 • Fundamental data cached hai.
-• Missing/invalid data se application crash avoid kiya gaya.
-• Chart missing columns ke against protected hai.
-• Cache refresh centralized hai.
-• Stock scanner mein individual stock failure poore scan ko stop nahi karta.
-• Trade plan invalid inputs par safely unavailable hota hai.
+• Fundamental percentage values double-multiply hone se protected hain.
+• Stock scanner individual stock failure par poora scan crash nahi karta.
+• Empty/missing data se fake signal generate nahi hota.
+• Streamlit refresh clear calls safely handle kiye gaye hain.
+• Trade plan sirf STRONG BUY / STRONG SELL state mein generate hota hai.
+
+Yahoo Finance broker-grade execution feed nahi hai.
 
 Actual trade se pehle broker ka live price,
 bid/ask, liquidity, slippage, position size,
@@ -3740,7 +3751,9 @@ market conditions aur risk verify karein.
 
 st.caption(
     "Last app refresh: "
-    + datetime.now(IST).strftime(
+    + datetime.now(
+        IST
+    ).strftime(
         "%d-%m-%Y %H:%M:%S IST"
     )
 )
