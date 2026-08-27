@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+import requests
 
 # ============================================================
 # CONFIG
@@ -37,6 +38,9 @@ MIN_INTRADAY_CANDLES = 100
 MIN_DAILY_CANDLES = 220
 MAX_WORKERS = 5
 INTRADAY_INTERVAL = "5m"
+UPSTOX_BASE = "https://api.upstox.com"
+UPSTOX_NIFTY_KEY = "NSE_INDEX|Nifty 50"
+UPSTOX_TIMEOUT = 12
 
 DEFAULT_STOCKS = [
     "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS",
@@ -114,6 +118,165 @@ def market_status():
     if dt_time(9, 15) <= now.time() <= dt_time(15, 30):
         return "🟢 NSE market hours"
     return "🟡 NSE market closed"
+
+# ============================================================
+# OPTIONAL PRIMARY LIVE SOURCE: UPSTOX V3
+# ============================================================
+
+def get_upstox_token():
+    """Read a token without hard-coding secrets.
+
+    The app remains runnable without a token using Yahoo as a fallback, but
+    real-time trading-grade NIFTY/options analysis should use the Upstox feed.
+    """
+    token = st.session_state.get("upstox_token", "")
+    if not token:
+        try:
+            token = st.secrets.get("UPSTOX_ACCESS_TOKEN", "")
+        except Exception:
+            token = ""
+    return str(token).strip()
+
+
+def upstox_headers(token):
+    return {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def upstox_get(path, token, params=None):
+    if not token:
+        return None
+    try:
+        r = requests.get(
+            UPSTOX_BASE + path,
+            headers=upstox_headers(token),
+            params=params or {},
+            timeout=UPSTOX_TIMEOUT,
+        )
+        if r.status_code != 200:
+            logging.warning("Upstox %s failed: %s %s", path, r.status_code, r.text[:300])
+            return None
+        payload = r.json()
+        if payload.get("status") not in (None, "success"):
+            return None
+        return payload
+    except Exception as exc:
+        logging.warning("Upstox request failed: %s", exc)
+        return None
+
+
+def upstox_candles_to_df(payload):
+    try:
+        candles = payload["data"]["candles"]
+    except Exception:
+        return pd.DataFrame()
+    rows = []
+    for c in candles:
+        if len(c) < 6:
+            continue
+        rows.append({
+            "Datetime": pd.to_datetime(c[0]),
+            "Open": safe_float(c[1]),
+            "High": safe_float(c[2]),
+            "Low": safe_float(c[3]),
+            "Close": safe_float(c[4]),
+            "Volume": safe_float(c[5], 0),
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).set_index("Datetime").sort_index()
+    return clean_ohlcv(df)
+
+
+@st.cache_data(ttl=DATA_TTL, show_spinner=False)
+def get_nifty_intraday_upstox(token):
+    payload = upstox_get(
+        f"/v3/historical-candle/intraday/{UPSTOX_NIFTY_KEY.replace('|', '%7C')}/minutes/5",
+        token,
+    )
+    return upstox_candles_to_df(payload) if payload else pd.DataFrame()
+
+
+@st.cache_data(ttl=DAILY_TTL, show_spinner=False)
+def get_nifty_daily_upstox(token):
+    today = datetime.now(IST).date()
+    from_date = today.replace(year=today.year - 2)
+    payload = upstox_get(
+        f"/v3/historical-candle/{UPSTOX_NIFTY_KEY.replace('|', '%7C')}/days/1/{today.isoformat()}/{from_date.isoformat()}",
+        token,
+    )
+    return upstox_candles_to_df(payload) if payload else pd.DataFrame()
+
+
+@st.cache_data(ttl=DATA_TTL, show_spinner=False)
+def get_nifty_options_upstox(token):
+    contracts = upstox_get("/v2/option/contract", token, {"instrument_key": UPSTOX_NIFTY_KEY})
+    if not contracts or not contracts.get("data"):
+        return None, pd.DataFrame(), pd.DataFrame(), []
+    today = datetime.now(IST).date()
+    expiries = sorted({str(x.get("expiry"))[:10] for x in contracts["data"] if x.get("expiry")})
+    valid = [x for x in expiries if pd.Timestamp(x).date() >= today]
+    if not valid:
+        return None, pd.DataFrame(), pd.DataFrame(), []
+    expiry = valid[0]
+    payload = upstox_get(
+        "/v2/option/chain",
+        token,
+        {"instrument_key": UPSTOX_NIFTY_KEY, "expiry_date": expiry},
+    )
+    if not payload or not payload.get("data"):
+        return expiry, pd.DataFrame(), pd.DataFrame(), valid
+
+    calls, puts = [], []
+    for item in payload["data"]:
+        strike = safe_float(item.get("strike_price"))
+        for side, key, target in [("CE", "call_options", calls), ("PE", "put_options", puts)]:
+            obj = item.get(key) or {}
+            md = obj.get("market_data") or {}
+            g = obj.get("option_greeks") or {}
+            if not md:
+                continue
+            target.append({
+                "strike": strike,
+                "lastPrice": safe_float(md.get("ltp")),
+                "bid": safe_float(md.get("bid_price")),
+                "ask": safe_float(md.get("ask_price")),
+                "volume": safe_float(md.get("volume"), 0),
+                "openInterest": safe_float(md.get("oi"), 0),
+                "prevOI": safe_float(md.get("prev_oi"), 0),
+                "impliedVolatility": safe_float(g.get("iv")),
+                "delta": safe_float(g.get("delta")),
+                "gamma": safe_float(g.get("gamma")),
+                "theta": safe_float(g.get("theta")),
+                "vega": safe_float(g.get("vega")),
+                "pop": safe_float(g.get("pop")),
+                "instrument_key": obj.get("instrument_key", ""),
+                "trading_symbol": obj.get("trading_symbol", ""),
+            })
+    return expiry, clean_options(pd.DataFrame(calls)), clean_options(pd.DataFrame(puts)), valid
+
+
+def get_live_nifty_data():
+    token = get_upstox_token()
+    if token:
+        intraday = get_nifty_intraday_upstox(token)
+        daily = get_nifty_daily_upstox(token)
+        if not intraday.empty and not daily.empty:
+            return intraday, daily, "Upstox V3"
+    return get_nifty_intraday(), get_nifty_daily(), "Yahoo fallback"
+
+
+def get_live_nifty_options():
+    token = get_upstox_token()
+    if token:
+        result = get_nifty_options_upstox(token)
+        if result[1].shape[0] or result[2].shape[0]:
+            return (*result, "Upstox V2 Option Chain")
+    result = get_nifty_options()
+    return (*result, "Yahoo fallback")
 
 # ============================================================
 # DATA CLEANING / DOWNLOAD
@@ -757,6 +920,14 @@ def analyze_stock(symbol, intraday, daily):
         return None
     result["day_change"] = calculate_day_change(daily, result["price"])
     plan = build_stock_plan(result)
+    # Professional-style opportunity score: signal edge + momentum + volume + trend quality + R:R.
+    rr = 2.5 if finite(plan.get("t2", np.nan)) else 0
+    trend = safe_float(result.get("bull_score"), 0) - safe_float(result.get("bear_score"), 0)
+    relvol = clamp(safe_float(result.get("volume_ratio"), 1), 0, 5)
+    result["opportunity_score"] = clamp(
+        50 + trend * 0.35 + (relvol - 1) * 8 + rr * 4 + (8 if result.get("entry_status") == "ENTRY NOW" else 0),
+        0, 100
+    )
     result.update({
         "entry": plan.get("entry", np.nan), "sl": plan.get("sl", np.nan),
         "t1": plan.get("t1", np.nan), "t2": plan.get("t2", np.nan), "t3": plan.get("t3", np.nan),
@@ -769,6 +940,20 @@ def analyze_stock(symbol, intraday, daily):
 # UI
 # ============================================================
 
+with st.sidebar:
+    st.header("🔐 Live Data")
+    token_input = st.text_input(
+        "Upstox Access Token (optional)",
+        value=st.session_state.get("upstox_token", ""),
+        type="password",
+        help="Token app mein hard-code mat karein. Token na ho to NIFTY/options Yahoo fallback use karega.",
+    )
+    st.session_state.upstox_token = token_input.strip()
+    if st.session_state.upstox_token:
+        st.success("Upstox live-data mode enabled")
+    else:
+        st.warning("Yahoo fallback active — real-money trading se pehle live broker feed verify karein.")
+
 st.title("📈 NIFTY + Stock Signal Pro V4")
 st.caption("Actionable Entry • SL • T1/T2/T3 • CE/PE strike • NIFTY trigger • Exit rules • Stock trade plans")
 
@@ -780,8 +965,7 @@ tab_nifty, tab_stocks = st.tabs(["📊 NIFTY + OPTIONS", "🚀 STOCK SCANNER"])
 
 def render_nifty():
     with st.spinner("NIFTY data load ho raha hai..."):
-        nifty_intraday = get_nifty_intraday()
-        nifty_daily = get_nifty_daily()
+        nifty_intraday, nifty_daily, nifty_source = get_live_nifty_data()
 
     if nifty_intraday.empty or nifty_daily.empty:
         st.error("❌ NIFTY data available nahi hai.")
@@ -795,7 +979,7 @@ def render_nifty():
 
     price = market["price"]
     atm = get_atm(price)
-    expiry, calls, puts, expirations = get_nifty_options()
+    expiry, calls, puts, expirations, option_source = get_live_nifty_options()
     ce_row = select_option(calls, atm, "CE")
     pe_row = select_option(puts, atm, "PE")
     oi_pcr, volume_pcr = calculate_pcr(calls, puts)
@@ -808,7 +992,7 @@ def render_nifty():
     m3.metric("Bull Score", f"{market['bull_score']:.0f}%")
     m4.metric("Bear Score", f"{market['bear_score']:.0f}%")
     m5.metric("Signal", market["signal"])
-    st.caption(f"{market_status()} • Signal uses last completed 5-minute candle: {market['candle_time']}")
+    st.caption(f"{market_status()} • Data: {nifty_source} • Options: {option_source} • Signal uses last completed 5-minute candle: {market['candle_time']}")
 
     st.subheader("🚨 FINAL SIGNAL")
     # Strong trend = immediate candidate; moderate bullish trend = CE WATCH.
@@ -847,7 +1031,7 @@ def render_nifty():
 
     st.subheader("⛓️ Option Chain Intelligence")
     if calls.empty and puts.empty:
-        st.warning("⚠️ Yahoo Finance option chain unavailable — premium price invent nahi ki jayegi.")
+        st.warning("⚠️ Option-chain data unavailable — premium price invent nahi ki jayegi.")
     else:
         o = st.columns(6)
         o[0].metric("Expiry", str(expiry) if expiry else "-")
@@ -981,6 +1165,9 @@ with tab_nifty:
         get_nifty_intraday.clear()
         get_nifty_daily.clear()
         get_nifty_options.clear()
+        get_nifty_intraday_upstox.clear()
+        get_nifty_daily_upstox.clear()
+        get_nifty_options_upstox.clear()
         st.session_state.nifty_last_refresh = datetime.now(IST)
         st.rerun()
 
@@ -1044,7 +1231,7 @@ with tab_stocks:
             st.session_state.stock_results = None
         else:
             df = pd.DataFrame(results)
-            df = df.sort_values(["score", "bull_score", "volume_ratio"], ascending=False, na_position="last")
+            df = df.sort_values(["opportunity_score", "bull_score", "score", "volume_ratio"], ascending=False, na_position="last")
             st.session_state.stock_results = df
             st.session_state.last_stock_scan = datetime.now(IST)
 
@@ -1055,6 +1242,42 @@ with tab_stocks:
         if st.session_state.last_stock_scan:
             st.caption("Last scan: " + st.session_state.last_stock_scan.strftime("%d-%m-%Y %H:%M:%S IST"))
 
+        # Highest-quality setup first; this is NOT a profit guarantee.
+        best = result_df.iloc[0]
+        st.subheader("⭐ STOCK OF THE DAY")
+        b = st.columns(7)
+        b[0].metric("Stock", str(best["symbol"]))
+        b[1].metric("Status", str(best["entry_status"]))
+        b[2].metric("Opportunity", f"{safe_float(best.get("opportunity_score"), 0):.0f}/100")
+        b[3].metric("Entry", fmt(best["entry"]))
+        b[4].metric("SL", fmt(best["sl"]))
+        b[5].metric("T1", fmt(best["t1"]))
+        b[6].metric("T2", fmt(best["t2"]))
+        st.caption(f"T3 ₹{fmt(best["t3"])} • Estimated T1/T2/T3 move {pct(best["t1_pct"])}/{pct(best["t2_pct"])}/{pct(best["t3_pct"])} • This is a model estimate, not guaranteed profit.")
+
+        # Small/mid-cap ranking is based on market-cap data, NOT share price.
+        with st.expander("🚀 Best Small/Mid-Cap Opportunity", expanded=True):
+            cap_rows = []
+            for _, rr in result_df.head(15).iterrows():
+                fcap = get_fundamentals(rr["symbol"])["market_cap"]
+                if finite(fcap):
+                    cap_rows.append((rr, fcap))
+            cap_rows = sorted(cap_rows, key=lambda x: x[1])
+            if cap_rows:
+                small_candidates = [x for x in cap_rows if x[1] < 2e12]
+                pool = small_candidates or cap_rows
+                rr, cap = max(pool, key=lambda x: safe_float(x[0].get("opportunity_score"), 0))
+                st.write(f"**{rr["symbol"]}** — {rr["entry_status"]} • Market Cap ₹{cap/1e7:,.0f} Cr")
+                cc = st.columns(6)
+                cc[0].metric("Entry", fmt(rr["entry"]))
+                cc[1].metric("SL", fmt(rr["sl"]))
+                cc[2].metric("T1", fmt(rr["t1"]))
+                cc[3].metric("T2", fmt(rr["t2"]))
+                cc[4].metric("T3", fmt(rr["t3"]))
+                cc[5].metric("Opportunity", f"{safe_float(rr.get("opportunity_score"),0):.0f}/100")
+            else:
+                st.info("Market-cap data unavailable; small-cap ranking ko guess nahi kiya jayega.")
+
         st.subheader("🏆 Top Current Setups")
         # Never hide the best stocks just because the strict filter is empty.
         # Mark the entry status so the user can see whether to WAIT or ENTER.
@@ -1062,8 +1285,8 @@ with tab_stocks:
         top = (filtered if not filtered.empty else result_df).head(10)
         if filtered.empty:
             st.warning("Strict bullish filter me clean setup nahi mila — neeche best available setups diye gaye hain. ENTRY status ko follow karein.")
-        cols = ["symbol", "price", "signal", "bull_score", "score", "entry_status", "entry", "sl", "t1", "t2", "t3", "t1_pct", "t2_pct", "t3_pct"]
-        st.dataframe(top[cols].rename(columns={"entry_status":"Entry Status","entry":"Entry","sl":"SL","t1":"T1","t2":"T2","t3":"T3","t1_pct":"T1 Profit %","t2_pct":"T2 Profit %","t3_pct":"T3 Profit %"}).round(2), use_container_width=True, hide_index=True)
+        cols = ["symbol", "price", "signal", "opportunity_score", "bull_score", "score", "entry_status", "entry", "sl", "t1", "t2", "t3", "t1_pct", "t2_pct", "t3_pct"]
+        st.dataframe(top[cols].rename(columns={"opportunity_score":"Opportunity %","entry_status":"Entry Status","entry":"Entry","sl":"SL","t1":"T1","t2":"T2","t3":"T3","t1_pct":"T1 Profit %","t2_pct":"T2 Profit %","t3_pct":"T3 Profit %"}).round(2), use_container_width=True, hide_index=True)
 
         st.subheader("🔎 Top 5 Detailed Analysis")
         for rank, (_, row) in enumerate(top.head(5).iterrows(), start=1):
@@ -1104,7 +1327,7 @@ with tab_stocks:
 
         st.subheader("📋 Complete Scan Results")
         cols = ["symbol", "price", "signal", "bull_score", "score", "entry_status", "entry", "sl", "t1", "t2", "t1_pct", "t2_pct"]
-        st.dataframe(result_df[cols].rename(columns={"entry_status":"Entry Status","entry":"Entry","sl":"SL","t1":"T1","t2":"T2","t1_pct":"T1 Profit %","t2_pct":"T2 Profit %"}).round(2), use_container_width=True, hide_index=True)
+        st.dataframe(result_df[cols].rename(columns={"opportunity_score":"Opportunity %","entry_status":"Entry Status","entry":"Entry","sl":"SL","t1":"T1","t2":"T2","t1_pct":"T1 Profit %","t2_pct":"T2 Profit %"}).round(2), use_container_width=True, hide_index=True)
 
         st.subheader("📊 Strongest Bullish Setups")
         chart_df = result_df.sort_values("bull_score", ascending=False).head(10).set_index("symbol")[["bull_score"]]
